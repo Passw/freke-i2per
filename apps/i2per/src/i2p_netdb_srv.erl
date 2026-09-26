@@ -1,0 +1,562 @@
+-module(i2p_netdb_srv).
+
+-moduledoc """
+The process that owns the local NetDb store.
+
+Per the project's process philosophy, the NetDb is shared mutable state and so
+is owned by exactly one process, a `gen_server` registered locally as
+`i2p_netdb_srv`. It is a child of `m:i2per_sup` (restart type `permanent` —
+unlike a connection, a crashed NetDb holds nothing a fresh store cannot
+rebuild, so a restart is harmless).
+
+Every call is a thin synchronous wrapper over a pure `m:i2p_netdb` operation;
+no peer or connection state lives here, so a slow peer can never block the
+store. Network-facing work (sending DatabaseLookup messages, storing replies)
+belongs to the peer manager (`m:i2p_peer`), which reads and writes through
+this API.
+
+## Persistence
+
+When app env `i2per` → `data_dir` names a directory, the store is saved to
+`netdb.bin` inside that directory on shutdown and periodically (every 15
+minutes by default). The write is an atomic replacement with private `0600`
+permissions. On startup it is loaded back if present; a malformed or
+unreadable existing file fails closed instead of being replaced by an empty
+store. An expiry sweep runs every 30 minutes, removing RouterInfos older than
+27 hours and expired LeaseSets via `m:i2p_netdb:remove_expired/3`. The timer
+intervals can be shortened with the `netdb_autosave_ms` and `netdb_expiry_ms`
+application settings for hermetic tests and soak diagnostics.
+
+## Usage
+
+```erlang
+%% Fill the store from a DatabaseStore payload.
+{ok, _Store, added} =
+    i2p_netdb_srv:store_binary(
+        RouterInfoBytes,
+        erlang:system_time(millisecond)
+    ),
+
+%% Ask for replication targets: the 3 closest eligible floodfills.
+Target = <<...32-byte router hash...>>,
+Floodfills = i2p_netdb_srv:closest_floodfills(Target, 3, []).
+```
+""".
+
+-behaviour(gen_server).
+
+-export([
+    start_link/0,
+    store/2,
+    store_binary/2,
+    store_ls/2,
+    store_ls_binary/2,
+    find/1,
+    find_ls/1,
+    remove/1,
+    routers/0,
+    keys/0,
+    ls_keys/0,
+    ls_count/0,
+    count/0,
+    capacity/0,
+    closest/2,
+    closest_floodfills/3,
+    closest_non_floodfills/3,
+    save/0,
+    load/0,
+    remove_expired/0,
+    timer_counts/0,
+    stats/0
+]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+-doc "Start the NetDb process, registered locally as `i2p_netdb_srv`.".
+-spec start_link() -> {ok, pid()} | {error, term()}.
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+-doc """
+Store a verified RouterInfo.
+
+Input: `RI` — a parsed RouterInfo; `NowMs` — wall-clock ms since epoch.
+Output: `added | updated | older | from_future | too_old`, as in
+`m:i2p_netdb:store/3`.
+""".
+-spec store(i2p_router_info:router_info(), non_neg_integer()) ->
+    added | updated | older | from_future | too_old.
+store(RI, NowMs) ->
+    gen_server:call(?MODULE, {store, RI, NowMs}).
+
+-doc """
+Store a RouterInfo from its raw signed bytes.
+
+Input: `Bin` — full signed RouterInfo bytes; `NowMs` — wall-clock ms since
+epoch.
+Output: `{ok, Outcome}` as in `m:i2p_netdb:store/3`, or `{error, Reason}` when
+the bytes do not decode to a signature-verifying RouterInfo.
+""".
+-spec store_binary(binary(), non_neg_integer()) ->
+    {ok, added | updated | older | from_future | too_old} | {error, term()}.
+store_binary(Bin, NowMs) ->
+    gen_server:call(?MODULE, {store_binary, Bin, NowMs}).
+
+-doc """
+Look up a router by hash.
+
+Input: `Key` — the router hash.
+Output: `{ok, RouterInfo}` when present, `not_found` otherwise.
+""".
+-spec find(i2p_netdb:router_key()) -> {ok, i2p_router_info:router_info()} | not_found.
+find(Key) ->
+    gen_server:call(?MODULE, {find, Key}).
+
+-doc """
+Store a verified LeaseSet2.
+
+Input: `LS` — a parsed LeaseSet; `NowSec` — wall-clock seconds since epoch.
+Output: `added | updated | older | from_future | expired`, as in
+`m:i2p_netdb:store_ls/3`.
+""".
+-spec store_ls(i2p_leaset:lease_set(), non_neg_integer()) ->
+    added | updated | older | from_future | expired.
+store_ls(LS, NowSec) ->
+    gen_server:call(?MODULE, {store_ls, LS, NowSec}).
+
+-doc """
+Store a LeaseSet2 from its raw signed content bytes.
+
+Input: `Bin` — the content bytes (without the store-type byte); `NowSec` —
+wall-clock seconds since epoch.
+Output: `{ok, Outcome}` as in `f:store_ls/2`, or `{error, Reason}` when the
+bytes do not decode to a signature-verifying LeaseSet2.
+""".
+-spec store_ls_binary(binary(), non_neg_integer()) ->
+    {ok, added | updated | older | from_future | expired} | {error, term()}.
+store_ls_binary(Bin, NowSec) ->
+    gen_server:call(?MODULE, {store_ls_binary, Bin, NowSec}).
+
+-doc """
+Look up a LeaseSet2 by destination hash.
+
+Input: `Key` — the destination hash.
+Output: `{ok, LeaseSet}` when present, `not_found` otherwise.
+""".
+-spec find_ls(i2p_netdb:ls_key()) -> {ok, i2p_leaset:lease_set()} | not_found.
+find_ls(Key) ->
+    gen_server:call(?MODULE, {find_ls, Key}).
+
+-doc """
+Remove a router by hash.
+
+Input: `Key` — the router hash.
+Output: `removed` when it was present, `not_found` otherwise.
+""".
+-spec remove(i2p_netdb:router_key()) -> removed | not_found.
+remove(Key) ->
+    gen_server:call(?MODULE, {remove, Key}).
+
+-doc "All stored RouterInfos, most recently stored first.".
+-spec routers() -> [i2p_router_info:router_info()].
+routers() ->
+    gen_server:call(?MODULE, routers).
+
+-doc "All stored router hashes, most recently stored first.".
+-spec keys() -> [i2p_netdb:router_key()].
+keys() ->
+    gen_server:call(?MODULE, keys).
+
+-doc "All stored destination hashes, most recently stored first.".
+-spec ls_keys() -> [i2p_netdb:ls_key()].
+ls_keys() ->
+    gen_server:call(?MODULE, ls_keys).
+
+-doc "The number of stored LeaseSets.".
+-spec ls_count() -> non_neg_integer().
+ls_count() ->
+    gen_server:call(?MODULE, ls_count).
+
+-doc "The number of stored routers.".
+-spec count() -> non_neg_integer().
+count() ->
+    gen_server:call(?MODULE, count).
+
+-doc "The eviction capacity of the store.".
+-spec capacity() -> pos_integer().
+capacity() ->
+    gen_server:call(?MODULE, capacity).
+
+-doc """
+The `N` stored router hashes closest to `Target`.
+
+Input: `Target` — the router hash to measure against; `N` — how many to
+return.
+Output: up to `N` hashes sorted by routing-key XOR distance, closest first.
+""".
+-spec closest(i2p_netdb:router_key(), non_neg_integer()) -> [i2p_netdb:router_key()].
+closest(Target, N) ->
+    gen_server:call(?MODULE, {closest, Target, N}).
+
+-doc """
+The `N` closest eligible floodfill hashes to `Target`, excluding `Excluded`.
+
+Input: `Target`, `N`, `Excluded` as in `m:i2p_netdb:closest_floodfills/4`.
+Output: up to `N` floodfill hashes, closest first.
+""".
+-spec closest_floodfills(i2p_netdb:router_key(), non_neg_integer(), [i2p_netdb:router_key()]) ->
+    [i2p_netdb:router_key()].
+closest_floodfills(Target, N, Excluded) ->
+    gen_server:call(?MODULE, {closest_floodfills, Target, N, Excluded}).
+
+-doc """
+The `N` closest non-floodfill hashes to `Target`, excluding `Excluded`.
+
+Input: `Target`, `N`, `Excluded` as in `m:i2p_netdb:closest_non_floodfills/4`.
+Output: up to `N` non-floodfill hashes, closest first.
+""".
+-spec closest_non_floodfills(i2p_netdb:router_key(), non_neg_integer(), [i2p_netdb:router_key()]) ->
+    [i2p_netdb:router_key()].
+closest_non_floodfills(Target, N, Excluded) ->
+    gen_server:call(?MODULE, {closest_non_floodfills, Target, N, Excluded}).
+
+-define(DEFAULT_AUTOSAVE_MS, 15 * 60 * 1000).
+-define(DEFAULT_EXPIRY_MS, 30 * 60 * 1000).
+
+-define(AUTOSAVE_TIMERS, '$i2per_netdb_autosave_timers').
+-define(EXPIRY_TIMERS, '$i2per_netdb_expiry_timers').
+-define(LOAD_ERROR, '$i2per_netdb_load_error').
+
+-define(NETDB_FILE, "netdb.bin").
+
+-doc """
+Save the current store to disk.
+
+Input: none (uses the current process state).
+Output: `ok` when the file was written, `{error, Reason}` on I/O failure. Does
+nothing when `data_dir` is not configured.
+""".
+-spec save() -> ok | {error, term()}.
+save() ->
+    gen_server:call(?MODULE, save).
+
+-doc """
+Load a store from disk, replacing the current one.
+
+Input: none.
+Output: `ok` when the file was loaded, `{error, Reason}` on I/O failure or
+parse error. Does nothing when `data_dir` is not configured.
+""".
+-spec load() -> ok | {error, term()}.
+load() ->
+    gen_server:call(?MODULE, load).
+
+-doc """
+Sweep expired RouterInfos and LeaseSets.
+
+Input: none.
+Output: `{RoutersRemoved, LSRemoved}` — the number of entries evicted. Removes
+RouterInfos older than 27 hours and expired LeaseSets via
+`m:i2p_netdb:remove_expired/3`.
+""".
+-spec remove_expired() -> {non_neg_integer(), non_neg_integer()}.
+remove_expired() ->
+    gen_server:call(?MODULE, remove_expired).
+
+-doc """
+Return the number of pending autosave and expiry timers.
+
+The values should remain exactly one for each timer kind during normal
+operation. This is a small operational seam for soak tests and diagnostics.
+""".
+-spec timer_counts() -> #{autosave | expiry_sweep => non_neg_integer()}.
+timer_counts() ->
+    gen_server:call(?MODULE, timer_counts).
+
+-doc """
+Return a snapshot of operational counters.
+
+Input: none.
+Output: a map with keys `routers`, `lease_sets`, `capacity`, `saves`,
+`loads`, `expired_sweeps`, `routers_expired`, `ls_expired`.
+""".
+-spec stats() -> #{atom() => non_neg_integer()}.
+stats() ->
+    gen_server:call(?MODULE, stats).
+
+init([]) ->
+    Counters = #{
+        saves => 0,
+        loads => 0,
+        expired_sweeps => 0,
+        routers_expired => 0,
+        ls_expired => 0
+    },
+    Store0 = i2p_netdb:new(),
+    put(?LOAD_ERROR, false),
+    case maybe_load(Store0, Counters) of
+        {{Store1, Counters1}, ok} ->
+            schedule_autosave(),
+            schedule_expiry(),
+            {ok, {Store1, Counters1}};
+        {_State, {error, Reason}} ->
+            put(?LOAD_ERROR, true),
+            {stop, {netdb_load_failed, Reason}}
+    end.
+
+maybe_load(Store, Counters) ->
+    case data_dir() of
+        {ok, Dir} ->
+            Path = filename:join(Dir, ?NETDB_FILE),
+            case file:read_file(Path) of
+                {ok, Bin} ->
+                    case i2p_netdb:from_binary(Bin) of
+                        {ok, Loaded} ->
+                            C2 = Counters#{loads := maps:get(loads, Counters) + 1},
+                            {{Loaded, C2}, ok};
+                        {error, _} ->
+                            {{Store, Counters}, {error, parse_error}}
+                    end;
+                {error, enoent} ->
+                    {{Store, Counters}, ok};
+                {error, _} = Err ->
+                    {{Store, Counters}, Err}
+            end;
+        undefined ->
+            {{Store, Counters}, ok}
+    end.
+
+schedule_autosave() ->
+    Ref = erlang:send_after(autosave_interval(), self(), autosave),
+    put(?AUTOSAVE_TIMERS, [Ref | timer_refs(?AUTOSAVE_TIMERS)]),
+    ok.
+
+schedule_expiry() ->
+    Ref = erlang:send_after(expiry_interval(), self(), expiry_sweep),
+    put(?EXPIRY_TIMERS, [Ref | timer_refs(?EXPIRY_TIMERS)]),
+    ok.
+
+take_timer(Key) ->
+    case timer_refs(Key) of
+        [Ref | Rest] ->
+            put(Key, Rest),
+            Ref;
+        [] ->
+            undefined
+    end.
+
+timer_refs(Key) ->
+    case get(Key) of
+        undefined -> [];
+        Refs -> Refs
+    end.
+
+persist_allowed() ->
+    get(?LOAD_ERROR) =/= true.
+
+current_timer_counts() ->
+    #{
+        autosave => length(timer_refs(?AUTOSAVE_TIMERS)),
+        expiry_sweep => length(timer_refs(?EXPIRY_TIMERS))
+    }.
+
+autosave_interval() ->
+    configured_interval(netdb_autosave_ms, ?DEFAULT_AUTOSAVE_MS).
+
+expiry_interval() ->
+    configured_interval(netdb_expiry_ms, ?DEFAULT_EXPIRY_MS).
+
+configured_interval(Key, Default) ->
+    case application:get_env(i2per, Key) of
+        {ok, Value} when is_integer(Value), Value > 0 -> Value;
+        _ -> Default
+    end.
+
+handle_call({store, RI, NowMs}, _From, {Store, Counters}) ->
+    {Store2, Outcome} = i2p_netdb:store(Store, RI, NowMs),
+    {reply, Outcome, {Store2, Counters}};
+handle_call({store_binary, Bin, NowMs}, _From, {Store, Counters}) ->
+    case i2p_netdb:store_binary(Store, Bin, NowMs) of
+        {ok, Store2, Outcome} -> {reply, {ok, Outcome}, {Store2, Counters}};
+        {error, Reason} -> {reply, {error, Reason}, {Store, Counters}}
+    end;
+handle_call({store_ls, LS, NowSec}, _From, {Store, Counters}) ->
+    {Store2, Outcome} = i2p_netdb:store_ls(Store, LS, NowSec),
+    {reply, Outcome, {Store2, Counters}};
+handle_call({store_ls_binary, Bin, NowSec}, _From, {Store, Counters}) ->
+    case i2p_netdb:store_ls_binary(Store, Bin, NowSec) of
+        {ok, Store2, Outcome} -> {reply, {ok, Outcome}, {Store2, Counters}};
+        {error, Reason} -> {reply, {error, Reason}, {Store, Counters}}
+    end;
+handle_call({find, Key}, _From, {Store, _} = State) ->
+    case i2p_netdb:find(Store, Key) of
+        {ok, RI} -> {reply, {ok, RI}, State};
+        error -> {reply, not_found, State}
+    end;
+handle_call({find_ls, Key}, _From, {Store, _} = State) ->
+    case i2p_netdb:find_ls(Store, Key) of
+        {ok, LS} -> {reply, {ok, LS}, State};
+        error -> {reply, not_found, State}
+    end;
+handle_call({remove, Key}, _From, {Store, Counters}) ->
+    {Store2, Outcome} = i2p_netdb:remove(Store, Key),
+    {reply, Outcome, {Store2, Counters}};
+handle_call(routers, _From, {Store, _} = State) ->
+    {reply, i2p_netdb:routers(Store), State};
+handle_call(keys, _From, {Store, _} = State) ->
+    {reply, i2p_netdb:keys(Store), State};
+handle_call(ls_keys, _From, {Store, _} = State) ->
+    {reply, i2p_netdb:ls_keys(Store), State};
+handle_call(ls_count, _From, {Store, _} = State) ->
+    {reply, i2p_netdb:ls_count(Store), State};
+handle_call(count, _From, {Store, _} = State) ->
+    {reply, i2p_netdb:count(Store), State};
+handle_call(capacity, _From, {Store, _} = State) ->
+    {reply, i2p_netdb:capacity(Store), State};
+handle_call({closest, Target, N}, _From, {Store, _} = State) ->
+    {reply, i2p_netdb:closest(Store, Target, N), State};
+handle_call({closest_floodfills, Target, N, Excluded}, _From, {Store, _} = State) ->
+    {reply, i2p_netdb:closest_floodfills(Store, Target, N, Excluded), State};
+handle_call({closest_non_floodfills, Target, N, Excluded}, _From, {Store, _} = State) ->
+    {reply, i2p_netdb:closest_non_floodfills(Store, Target, N, Excluded), State};
+handle_call(save, _From, {Store, Counters}) ->
+    case persist_allowed() of
+        false ->
+            {reply, {error, load_failed}, {Store, Counters}};
+        true ->
+            Result = save_to_disk(Store),
+            C2 = Counters#{saves := maps:get(saves, Counters) + 1},
+            {reply, Result, {Store, C2}}
+    end;
+handle_call(load, _From, {Store, Counters}) ->
+    {NewState, Result} = maybe_load(Store, Counters),
+    case Result of
+        ok -> put(?LOAD_ERROR, false);
+        {error, _} -> put(?LOAD_ERROR, true)
+    end,
+    {reply, Result, NewState};
+handle_call(remove_expired, _From, {Store, Counters}) ->
+    NowMs = erlang:system_time(millisecond),
+    NowSec = erlang:system_time(second),
+    {Store2, {RRemoved, LSRemoved}} = i2p_netdb:remove_expired(Store, NowMs, NowSec),
+    C2 = Counters#{
+        expired_sweeps := maps:get(expired_sweeps, Counters) + 1,
+        routers_expired := maps:get(routers_expired, Counters) + RRemoved,
+        ls_expired := maps:get(ls_expired, Counters) + LSRemoved
+    },
+    {reply, {RRemoved, LSRemoved}, {Store2, C2}};
+handle_call(timer_counts, _From, State) ->
+    {reply, current_timer_counts(), State};
+handle_call(stats, _From, {Store, Counters}) ->
+    Reply = Counters#{
+        routers => i2p_netdb:count(Store),
+        lease_sets => i2p_netdb:ls_count(Store),
+        capacity => i2p_netdb:capacity(Store)
+    },
+    {reply, Reply, {Store, Counters}}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(autosave, {Store, Counters}) ->
+    _ = take_timer(?AUTOSAVE_TIMERS),
+    C2 =
+        case persist_allowed() of
+            true ->
+                _ = save_to_disk(Store),
+                Counters#{saves := maps:get(saves, Counters) + 1};
+            false ->
+                Counters
+        end,
+    schedule_autosave(),
+    {noreply, {Store, C2}};
+handle_info(expiry_sweep, {Store, Counters}) ->
+    _ = take_timer(?EXPIRY_TIMERS),
+    NowMs = erlang:system_time(millisecond),
+    NowSec = erlang:system_time(second),
+    {Store2, {RRemoved, LSRemoved}} = i2p_netdb:remove_expired(Store, NowMs, NowSec),
+    C2 = Counters#{
+        expired_sweeps := maps:get(expired_sweeps, Counters) + 1,
+        routers_expired := maps:get(routers_expired, Counters) + RRemoved,
+        ls_expired := maps:get(ls_expired, Counters) + LSRemoved
+    },
+    schedule_expiry(),
+    {noreply, {Store2, C2}}.
+
+terminate(_Reason, {Store, _Counters}) ->
+    _ = cancel_timers(),
+    _ =
+        case persist_allowed() of
+            true -> save_to_disk(Store);
+            false -> ok
+        end,
+    ok.
+
+cancel_timers() ->
+    lists:foreach(
+        fun(Ref) -> erlang:cancel_timer(Ref) end,
+        timer_refs(?AUTOSAVE_TIMERS) ++ timer_refs(?EXPIRY_TIMERS)
+    ).
+
+save_to_disk(Store) ->
+    case data_dir() of
+        {ok, Dir} ->
+            Path = filename:join(Dir, ?NETDB_FILE),
+            TmpPath =
+                Path ++ ".tmp." ++ integer_to_list(erlang:unique_integer([positive, monotonic])),
+            Bin = i2p_netdb:to_binary(Store),
+            case filelib:ensure_dir(Path) of
+                ok -> write_private_atomic(Path, TmpPath, Bin);
+                {error, _} = Err -> Err
+            end;
+        undefined ->
+            ok
+    end.
+
+write_private_atomic(Path, TmpPath, Bin) ->
+    case file:open(TmpPath, [write, binary, exclusive]) of
+        {ok, Fd} ->
+            case file:write(Fd, Bin) of
+                ok ->
+                    case file:sync(Fd) of
+                        ok ->
+                            case file:close(Fd) of
+                                ok ->
+                                    case file:change_mode(TmpPath, 8#600) of
+                                        ok ->
+                                            rename_private(TmpPath, Path);
+                                        {error, _} = Err ->
+                                            _ = file:delete(TmpPath),
+                                            Err
+                                    end;
+                                {error, _} = Err ->
+                                    _ = file:delete(TmpPath),
+                                    Err
+                            end;
+                        {error, _} = Err ->
+                            _ = file:close(Fd),
+                            _ = file:delete(TmpPath),
+                            Err
+                    end;
+                {error, _} = Err ->
+                    _ = file:close(Fd),
+                    _ = file:delete(TmpPath),
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+rename_private(TmpPath, Path) ->
+    case file:rename(TmpPath, Path) of
+        ok ->
+            ok;
+        {error, _} = Err ->
+            _ = file:delete(TmpPath),
+            Err
+    end.
+
+data_dir() ->
+    case application:get_env(i2per, data_dir) of
+        {ok, Dir} when is_list(Dir) -> {ok, Dir};
+        _ -> undefined
+    end.

@@ -1,0 +1,135 @@
+-module(i2per_status_state_tests).
+
+-moduledoc """
+Unit tests for the `m:i2per_status_state` gen_server callbacks: realtime event
+counters, node-up/down handling, fallback polling to offline, and the
+not-implemented/irrelevant fallthrough clauses.
+
+The callbacks are exercised directly with crafted state maps (they are
+exported parts of the gen_server behaviour surface); the live server against a
+router is covered end-to-end in `m:i2per_status_tests`.
+""".
+
+-include_lib("eunit/include/eunit.hrl").
+
+-define(DEAD_NODE, 'i2per_status_unit@host-invalid').
+
+dead_state() ->
+    #{
+        router_node => ?DEAD_NODE,
+        subscribed => false,
+        online => false,
+        view => #{},
+        events => zero_counters()
+    }.
+
+zero_counters() ->
+    #{
+        tunnel_built => 0,
+        tunnel_failed => 0,
+        tunnel_expired => 0,
+        leaseset_published => 0,
+        sam_session_created => 0,
+        sam_session_closed => 0
+    }.
+
+%% Feed one event through handle_info and return the counter map.
+counts_for(Event) ->
+    State = dead_state(),
+    {noreply, State1} = i2per_status_state:handle_info({event, Event}, State),
+    maps:get(events, State1).
+
+%% Check one key was bumped to N and everything else stayed at 0.
+only_bumped(BumpedKey, N, Counters) ->
+    ?assertEqual(N, maps:get(BumpedKey, Counters)),
+    maps:fold(
+        fun
+            (K, _, Acc) when K =:= BumpedKey -> Acc;
+            (_, 0, Acc) -> Acc;
+            (K, V, _) -> erlang:error({unexpected_bump, K, V})
+        end,
+        ok,
+        Counters
+    ).
+
+tunnel_built_counts_test() ->
+    only_bumped(tunnel_built, 1, counts_for({tunnel_built, outbound, 3})).
+
+tunnel_failed_counts_test() ->
+    only_bumped(tunnel_failed, 1, counts_for({tunnel_failed, inbound, rejected})).
+
+tunnel_expired_counts_test() ->
+    only_bumped(tunnel_expired, 1, counts_for({tunnel_expired, outbound})).
+
+leaseset_published_counts_test() ->
+    only_bumped(
+        leaseset_published, 1, counts_for({leaseset_published, crypto:strong_rand_bytes(32)})
+    ).
+
+sam_session_created_counts_test() ->
+    only_bumped(sam_session_created, 1, counts_for({sam_session_created, <<"sid">>, stream})).
+
+sam_session_closed_counts_test() ->
+    only_bumped(sam_session_closed, 1, counts_for({sam_session_closed, <<"sid">>})).
+
+unknown_event_ignored_test() ->
+    C = counts_for({peer_connected, crypto:strong_rand_bytes(32)}),
+    ?assertEqual(zero_counters(), C).
+
+counters_accumulate_across_events_test() ->
+    State0 = dead_state(),
+    {noreply, State1} =
+        i2per_status_state:handle_info({event, {tunnel_failed, inbound, invalid}}, State0),
+    {noreply, State2} =
+        i2per_status_state:handle_info({event, {tunnel_failed, inbound, invalid}}, State1),
+    Counters = maps:get(events, State2),
+    ?assertEqual(2, maps:get(tunnel_failed, Counters)).
+
+handle_call_unsupported_test() ->
+    {reply, {error, not_implemented}, State} =
+        i2per_status_state:handle_call(bogus, undefined, dead_state()),
+    ?assertEqual(maps:get(events, dead_state()), maps:get(events, State)).
+
+handle_cast_fallthrough_test() ->
+    State = dead_state(),
+    {noreply, State} = i2per_status_state:handle_cast(whatever, State).
+
+nodeup_resubscribes_test() ->
+    State0 = dead_state(),
+    {noreply, State} =
+        i2per_status_state:handle_info({nodeup, ?DEAD_NODE}, State0),
+    %% subscribe/1 to an unreachable node collapses to false.
+    ?assertEqual(false, maps:get(subscribed, State)),
+    %% The real callback also schedules a poll via send_after (the callback
+    %% runs in this test process here, not in the live gen_server, so its
+    %% side effects would otherwise linger in the shared eunit worker's
+    %% mailbox and poison a later test). Drain the scheduled poll.
+    receive
+        poll -> ok
+    after 2000 ->
+        ok
+    end.
+
+nodedown_marks_offline_test() ->
+    State0 = dead_state(),
+    {noreply, State} =
+        i2per_status_state:handle_info({nodedown, ?DEAD_NODE}, State0),
+    ?assertEqual(false, maps:get(online, State)),
+    ?assertEqual(#{}, maps:get(view, State)).
+
+irrelevant_info_fallthrough_test() ->
+    State = dead_state(),
+    {noreply, State} = i2per_status_state:handle_info(irrelevant, State).
+
+poll_to_unreachable_goes_offline_test() ->
+    %% Previously-online router disappears: next poll must flip the view to
+    %% offline_view() instead of keeping the stale snapshot.
+    State0 = (dead_state())#{online => true, view => #{stale => 1}},
+    {noreply, State} = i2per_status_state:handle_info(poll, State0),
+    ?assertEqual(false, maps:get(online, State)),
+    ?assertEqual(#{}, maps:get(view, State)).
+
+terminate_and_code_change_test() ->
+    State = dead_state(),
+    ?assertEqual(ok, i2per_status_state:terminate(any, State)),
+    ?assertEqual({ok, State}, i2per_status_state:code_change(0, State, [])).

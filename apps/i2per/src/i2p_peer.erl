@@ -1,0 +1,1566 @@
+-module(i2p_peer).
+
+-moduledoc """
+The peer connection manager: owns the node's connections — NTCP2 and, when the
+router operator enables it, SSU2 — both dialed (outbound) and accepted
+(inbound, from the boot listeners) — sends and answers I2NP NetDb messages,
+populates the local NetDb, and forwards non-DB I2NP messages (garlic, tunnel
+data, tunnel gateway, OTBRM) to the tunnel manager (`m:i2p_tunnel_srv`).
+
+This module owns the router's peer connections and NetDb-facing I2NP traffic.
+It is a `gen_server` registered locally as `i2p_peer`, a `permanent` child of
+`m:i2per_sup`. Each connection is one transport session process spawned under
+the matching supervisor (`m:i2p_ntcp2_conn` under `m:i2p_ntcp2_sup`,
+`m:i2p_ssu2_conn` under `m:i2p_ssu2_sup`); the peer manager monitors them and
+handles their ready, frame, and data messages.
+
+## Transport selection
+
+Outbound dials run in a spawned process and prefer SSU2: when app env
+`i2per` -> `ssu2_enabled` is set, the local SSU2 listener is up, and the
+remote publishes a usable SSU2 address, the manager attempts the SSU2
+handshake there. The handshake blocks until it succeeds or fails; on failure
+(SessionCreated timeout, protocol error, or an attempt at a dead SSU2 port)
+the dial falls back to NTCP2 without retrying SSU2. When SSU2 is unavailable
+(disabled, no listener, or the remote is NTCP2-only) the dial goes straight
+to NTCP2. The live transport is surfaced per peer by `f:status/0`.
+
+Inbound sessions arrive from the boot listener as `bob`-role connections. The
+ready message carries the dialer's RouterInfo: when the connection's pid does
+not match any peer under our own outbound bookkeeping, the manager registers
+it as an inbound session (one live session per peer hash — a newer session
+replaces the older), learns the dialer's RouterInfo into the NetDb, announces
+our own RouterInfo back, and routes its frames like an outbound session. When
+no outbound connection is live, `f:send_when_ready/2` messages travel over the
+inbound session instead of being queued.
+
+A connection dies on its own (bad peer, closed socket) and the manager only
+ever observes that death via a monitor; it then waits out an exponential
+backoff before retrying (outbound connections only). Recovery and
+reconnection live here, above the connections, never inside them.
+
+The manager connects to seeds, performs exploratory
+`m:i2p_i2np:db_lookup/4` round-trips, fills the NetDb from
+DatabaseSearchReply and DatabaseStore messages, answers inbound RouterInfo
+and LeaseSet2 lookups, sends DeliveryStatus acknowledgements when requested,
+and publishes its RouterInfo to the closest floodfills
+(`f:publish_floodfills/0`). Every peer connection receives the local
+RouterInfo. The periodic refresh timer (`?REFRESH_INTERVAL_SECONDS`) re-signs
+and republishes it to the three closest floodfills.
+
+At boot the manager fires a one-shot, bounded floodfill-discovery kick (a
+short delay after `init`, `?FLOODFILL_DISCOVERY_KICK_MS` default, overridable
+via app env `i2per` -> `floodfill_discovery_delay_ms`). It selects at most
+three eligible floodfills and sends exploratory lookups toward them; when the
+NetDb has no eligible floodfill yet it falls back to at most three dialable
+known seeds. The reseed worker calls `f:discover/0` after its RouterInfos have
+traversed the manager, so the same bounded discovery runs after a successful
+fresh-client reseed instead of relying on a boot-time race. Incoming
+RouterInfos are remembered but are not dialed automatically; this prevents a
+75-router reseed bundle from turning into 75 outbound sessions.
+
+Inbound garlic (type 11), tunnel data (type 18), tunnel gateway (type 19), and
+OTBRM (type 26) messages are forwarded to `m:i2p_tunnel_srv` when that service
+is registered. This routes tunnel build and relay operations through the
+current supervisor tree.
+
+## Usage
+
+```erlang
+%% Start with the local identity and a seed RouterInfo list. The persistent
+%% boot supplies the identity from disk; callers can construct one explicitly.
+{ok, _} = i2p_peer:start_link(LocalKeys, SeedRouterInfos),
+
+%% Kick off an exploratory discovery toward one seed.
+i2p_peer:lookup(SeedHash, exploratory),
+
+%% Ask a specific peer for its RouterInfo or LeaseSet.
+i2p_peer:lookup(PeerHash, routerinfo),
+i2p_peer:lookup(PeerHash, leaseset),
+
+%% Ensure our RouterInfo is sent to a peer.
+i2p_peer:publish(PeerHash),
+
+%% Publish our RouterInfo to the 3 closest eligible floodfills, asking each
+%% for a DeliveryStatus acknowledgement.
+i2p_peer:publish_floodfills(),
+
+%% Shut the manager down.
+i2p_peer:stop().
+```
+""".
+
+-behaviour(gen_server).
+
+-export([
+    start_link/2,
+    learn_ri/1,
+    discover/0,
+    tunnel_lookup_reply/2,
+    lookup/2,
+    publish/1,
+    publish_floodfills/0,
+    advertise_introducers/1,
+    send_when_ready/2,
+    status/0,
+    dialed/0,
+    router_hash/0,
+    stop/0
+]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
+-export_type([local_keys/0]).
+
+-define(HANDSHAKE_TIMEOUT, 15000).
+-define(MAX_BACKOFF_SECONDS, 300).
+-define(REFRESH_INTERVAL_SECONDS, 300).
+%% Boot kick delay: after the peer manager comes up (and any reseed pass
+%% lands), fire an exploratory lookup at idle seeds so real floodfills enter
+%% the NetDb on their own instead of waiting for the first publish cycle.
+%% Overridable via app env `i2per` -> `floodfill_discovery_delay_ms` (0 in
+%% tests to run it synchronously after init).
+-define(FLOODFILL_DISCOVERY_KICK_MS, 1500).
+
+-doc """
+The router's local identity keys, shared between the managers. Carried by the
+peer manager from boot; `ri` is the current RouterInfo (re-signed on the
+refresh cycle), `hash` its NetDb key, `iv` the NTCP2 header IV and `sign_seed`
+the Ed25519 seed used to re-sign RouterInfos.
+""".
+-type local_keys() :: #{
+    static_priv := i2p_crypto:x25519_private_key(),
+    static_pub := i2p_crypto:x25519_public_key(),
+    hash := i2p_crypto:hash(),
+    iv := i2p_crypto:aes_iv(),
+    port => inet:port_number(),
+    sign_seed := i2p_crypto:ed25519_seed(),
+    sign_pub => i2p_crypto:ed25519_public_key(),
+    ri := i2p_router_info:router_info(),
+    intro_key => binary(),
+    %% The originally published SSU2 address, kept for restoring reachable
+    %% publication after a firewalled (introducer) swap.
+    ssu2_addr => i2p_router_info:router_address()
+}.
+
+-doc """
+Start the peer manager with our identity and seed RouterInfos.
+
+Input: `Local` — `t:local_keys/0`; `Seeds` — parsed RouterInfos to bootstrap
+from.
+Output: `{ok, Pid}` once the manager process is up (connections are started
+lazily on the first `f:lookup/2` / `f:publish/1`).
+""".
+-spec start_link(local_keys(), [i2p_router_info:router_info()]) ->
+    {ok, pid()} | {error, term()}.
+start_link(Local, Seeds) ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [Local, Seeds], []).
+
+-doc """
+Send a NetDb DatabaseLookup toward a peer.
+
+Input: `PeerHash` — the peer to ask (and, unless `exploratory`, the key to
+search for); `LookupType` — `any | leaseset | routerinfo | exploratory`.
+Output: `ok` — the request is queued until the connection is ready.
+""".
+-spec lookup(i2p_crypto:hash(), any | leaseset | routerinfo | exploratory) -> ok.
+lookup(PeerHash, LookupType) ->
+    gen_server:cast(?MODULE, {lookup, PeerHash, LookupType}).
+
+-doc """
+Ensure our RouterInfo is announced to a peer.
+
+Input: `PeerHash` — the peer to connect to (announcement happens on connect).
+Output: `ok` — the connection is (re)established; the RouterInfo is sent when
+it becomes ready.
+""".
+-spec publish(i2p_crypto:hash()) -> ok.
+publish(PeerHash) ->
+    gen_server:cast(?MODULE, {publish, PeerHash}).
+
+-doc """
+Publish our RouterInfo to the three closest eligible floodfills in the NetDb.
+
+Each floodfill receives our RouterInfo in a DatabaseStore with a nonzero reply
+token and a direct reply target back to us, so it acknowledges with a
+DeliveryStatus. Floodfills that are not connected yet get connected first; the
+announcement is sent when their connection becomes ready. Non-floodfill peers
+never receive a reply-token store from this call.
+
+Output: `ok` — the work is queued.
+""".
+-spec publish_floodfills() -> ok.
+publish_floodfills() ->
+    gen_server:cast(?MODULE, publish_floodfills).
+
+-doc """
+Publish this router as firewalled: swap its published SSU2 address for a
+non-published introducer address and re-announce, or restore the published
+address when `Introducers` is empty.
+
+Input: `Introducers` — up to three `t:i2p_router_info:introducer/0` entries the
+router relies on.
+Output: `ok` — the swap and re-announce are queued.
+""".
+-spec advertise_introducers([i2p_router_info:introducer()]) -> ok.
+advertise_introducers(Introducers) ->
+    gen_server:cast(?MODULE, {advertise_introducers, Introducers}).
+
+-doc """
+Inspect the peer manager.
+
+Input: none.
+Output: a map of peer hash to `#{status => connecting | connected | backoff,
+attempts => non_neg_integer(), transport => ntcp2 | ssu2}` — the status of
+each connection, how many consecutive connect attempts it has made, and which
+transport a live connection uses (outbound selection prefers SSU2 and falls
+back to NTCP2).
+""".
+-spec status() ->
+    #{
+        i2p_crypto:hash() => #{
+            status := connecting | connected | backoff,
+            attempts := non_neg_integer(),
+            transport := ntcp2 | ssu2
+        }
+    }.
+status() ->
+    gen_server:call(?MODULE, status).
+
+-doc """
+Our own router identity hash.
+
+Output: the 32-byte SHA-256 hash of this router's RouterInfo identity — the
+value other peers use to address us.
+""".
+-spec router_hash() -> i2p_crypto:hash().
+router_hash() ->
+    gen_server:call(?MODULE, router_hash).
+
+-doc """
+Send an I2NP message to a peer, connecting first if needed.
+
+Input: `PeerHash` — the target peer; `Msg` — a `t:i2p_i2np:i2np_message/0`
+to send. If the peer is already connected the message is sent immediately;
+otherwise it is queued and sent once the connection becomes ready.
+
+Output: `ok` — the message is queued or sent; errors are not returned because
+the send happens asynchronously when the connection opens.
+""".
+-spec send_when_ready(i2p_crypto:hash(), i2p_i2np:i2np_message()) -> ok.
+send_when_ready(PeerHash, Msg) ->
+    gen_server:cast(?MODULE, {send_when_ready, PeerHash, Msg}).
+
+-doc """
+Learn a RouterInfo from an out-of-band source.
+
+Input: `RI` — the decoded RouterInfo.
+Output: `ok` — the info is stored into the NetDb and kept as a connection
+candidate; duplicates are ignored. Unlike the DatabaseStore path this does
+not dial the peer: a fresh router must not connect to its whole reseed batch
+at once.
+""".
+-spec learn_ri(i2p_router_info:router_info()) -> ok.
+learn_ri(RI) ->
+    gen_server:cast(?MODULE, {learn_ri, RI}).
+
+-doc """
+Start bounded discovery from the current NetDb.
+
+Input: none. Output: `ok`. The peer manager chooses at most three eligible
+floodfills and queues exploratory lookups. If the NetDb has no eligible
+floodfill yet, it tries up to three known seed routers.
+""".
+-spec discover() -> ok.
+discover() ->
+    gen_server:cast(?MODULE, discover).
+
+-doc "Stop the peer manager gracefully.".
+-spec stop() -> ok.
+stop() ->
+    gen_server:cast(?MODULE, stop).
+
+-doc """
+Number of peers currently dialed into us (live inbound sessions).
+
+Input: none. Output: the count of distinct peer hashes with an open inbound
+session accepted by the boot listeners. Sessions are tracked per peer hash
+(`stop_replaced_inbound/3` keeps one live session per hash), so this is the
+number of distinct dialers we are currently serving.
+""".
+-spec dialed() -> non_neg_integer().
+dialed() ->
+    gen_server:call(?MODULE, dialed).
+
+init([Local, Seeds]) ->
+    SeedConfigs = [#{ri => RI, hash => i2p_router_info:hash(RI)} || RI <- Seeds],
+    lists:foreach(
+        fun(#{hash := Hash}) -> i2p_peer_rep:protect(Hash) end,
+        SeedConfigs
+    ),
+    RefreshRef = erlang:send_after(?REFRESH_INTERVAL_SECONDS * 1000, self(), refresh_routerinfo),
+    KickRef = erlang:send_after(discovery_kick_ms(), self(), kick_floodfill_discovery),
+    {ok, #{
+        local => Local,
+        known => SeedConfigs,
+        peers => #{},
+        inbound => #{},
+        pending => #{},
+        pending_sends => #{},
+        our_hash => i2p_router_info:hash(maps:get(ri, Local)),
+        refresh_ref => RefreshRef,
+        discovery_kick_ref => KickRef
+    }}.
+
+handle_call(router_hash, _From, State) ->
+    Local = maps:get(local, State),
+    {reply, maps:get(hash, Local), State};
+handle_call(status, _From, State) ->
+    #{peers := Peers} = State,
+    Summary = maps:map(
+        fun(_Hash, PeerState) ->
+            #{
+                status => maps:get(status, PeerState),
+                attempts => maps:get(attempts, PeerState),
+                transport => maps:get(transport, PeerState, ntcp2)
+            }
+        end,
+        Peers
+    ),
+    {reply, Summary, State};
+handle_call(dialed, _From, State) ->
+    {reply, map_size(maps:get(inbound, State, #{})), State};
+handle_call(_Request, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast({lookup, PeerHash, LookupType}, State) ->
+    case peer_status(PeerHash, State) of
+        connected ->
+            {ok, PeerState} = peer_state(PeerHash, State),
+            ConnPid = maps:get(conn, PeerState),
+            Transport = maps:get(transport, PeerState, ntcp2),
+            send_db_lookup(ConnPid, Transport, maps:get(our_hash, State), PeerHash, LookupType),
+            {noreply, State};
+        _ ->
+            State1 = enqueue_lookup(PeerHash, LookupType, State),
+            {noreply, maybe_connect(PeerHash, State1)}
+    end;
+handle_cast({publish, PeerHash}, State) ->
+    {noreply, maybe_connect(PeerHash, State)};
+handle_cast(publish_floodfills, State) ->
+    {noreply, floodfill_publish(State)};
+handle_cast({advertise_introducers, Introducers}, State) ->
+    Local = i2p_identity:set_ssu2_introducers(maps:get(local, State), Introducers),
+    {noreply, floodfill_publish(State#{local := Local})};
+handle_cast({send_when_ready, PeerHash, Msg}, State) ->
+    case peer_status(PeerHash, State) of
+        connected ->
+            {ok, PeerState} = peer_state(PeerHash, State),
+            ConnPid = maps:get(conn, PeerState),
+            Transport = maps:get(transport, PeerState, ntcp2),
+            send_i2np(ConnPid, Transport, Msg),
+            {noreply, State};
+        _ ->
+            %% Prefer a live inbound session to queueing and dialing a peer
+            %% that already reached us.
+            case inbound_conn(PeerHash, State) of
+                {ok, ConnPid, Transport} ->
+                    send_i2np(ConnPid, Transport, Msg),
+                    {noreply, State};
+                error ->
+                    State1 = enqueue_send(PeerHash, Msg, State),
+                    {noreply, maybe_connect(PeerHash, State1)}
+            end
+    end;
+handle_cast(stop, State) ->
+    #{peers := Peers} = State,
+    _ = cancel_timer(maps:find(refresh_ref, State)),
+    _ = cancel_timer(maps:find(discovery_kick_ref, State)),
+    lists:foreach(
+        fun({_Hash, #{conn := Conn}}) ->
+            case Conn of
+                undefined -> ok;
+                _ -> stop_conn(Conn)
+            end
+        end,
+        maps:to_list(Peers)
+    ),
+    lists:foreach(
+        fun({ConnPid, _}) -> stop_conn(ConnPid) end,
+        maps:to_list(maps:get(inbound, State, #{}))
+    ),
+    {stop, normal, State};
+handle_cast({learn_ri, RI}, State) ->
+    {noreply, learn_ri(RI, State)};
+handle_cast(discover, State) ->
+    {noreply, kick_floodfill_discovery(State)};
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info({conn_started, PeerHash, ConnPid, Transport}, State) ->
+    {noreply, handle_conn_started(PeerHash, ConnPid, Transport, State)};
+handle_info({connect_failed, PeerHash}, State) ->
+    {noreply, handle_connect_failed(PeerHash, State)};
+handle_info({ntcp2_ready, ConnPid, RemoteRI}, State) ->
+    case find_conn_peer(ConnPid, State) of
+        {_PeerHash, _PeerState} ->
+            {noreply, handle_conn_ready(ConnPid, ntcp2, State)};
+        not_found ->
+            {noreply, handle_inbound_ready(ConnPid, RemoteRI, ntcp2, State)}
+    end;
+handle_info({ssu2_ready, ConnPid, _Keys, RemoteRI}, State) ->
+    case find_conn_peer(ConnPid, State) of
+        {_PeerHash, _PeerState} ->
+            {noreply, handle_ssu2_ready(ConnPid, State)};
+        not_found when RemoteRI =/= undefined ->
+            {noreply, handle_inbound_ready(ConnPid, RemoteRI, ssu2, State)};
+        not_found ->
+            {noreply, handle_ssu2_unregistered_inbound(ConnPid, State)}
+    end;
+handle_info({ssu2_data, ConnPid, Blocks}, State) ->
+    {noreply, handle_ssu2_data(ConnPid, Blocks, State)};
+handle_info({ssu2_closed, ConnPid, _Reason}, State) ->
+    {noreply, handle_conn_down_by_pid(ConnPid, State)};
+handle_info({ntcp2_frame, ConnPid, Payload}, State) ->
+    {noreply, handle_frame(ConnPid, Payload, State)};
+handle_info({'DOWN', MonRef, process, _ConnPid, _Reason}, State) ->
+    {noreply, handle_conn_down(MonRef, State)};
+handle_info({retry_peer, PeerHash}, State) ->
+    {noreply, maybe_connect(PeerHash, State)};
+handle_info(refresh_routerinfo, State) ->
+    State1 = floodfill_publish(State),
+    RefreshRef = erlang:send_after(?REFRESH_INTERVAL_SECONDS * 1000, self(), refresh_routerinfo),
+    {noreply, State1#{refresh_ref := RefreshRef}};
+handle_info(kick_floodfill_discovery, State) ->
+    {noreply, kick_floodfill_discovery(State)};
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+%%%%%%%%% %%% Internal %%%%%%%
+
+handle_conn_started(PeerHash, ConnPid, Transport, State) ->
+    case peer_state(PeerHash, State) of
+        {ok, PeerState} ->
+            MonRef = erlang:monitor(process, ConnPid),
+            Updated = PeerState#{conn := ConnPid, mon := MonRef, transport := Transport},
+            put_peer(PeerHash, Updated, State);
+        error ->
+            stop_conn(ConnPid),
+            State
+    end.
+
+%% An SSU2 outbound (Alice) session reported `{ssu2_ready, ...}`: the
+%% handshake completed, so mark the peer connected and flush queued work — the
+%% SSU2 analogue of `f:handle_conn_ready/3` (which stays NTCP2-only because
+%% only NTCP2's ready message carries the remote RouterInfo used to learn an
+%% inbound peer).
+handle_ssu2_ready(ConnPid, State) ->
+    case find_conn_peer(ConnPid, State) of
+        {PeerHash, PeerState} ->
+            Updated = PeerState#{status := connected, attempts := 0, backoff := 0},
+            State1 = put_peer(PeerHash, Updated, State),
+            i2p_events:notify({peer_connected, PeerHash}),
+            i2p_peer_rep:connected(PeerHash),
+            State2 = send_pending(ConnPid, ssu2, PeerHash, State1),
+            State3 = send_pending_sends(ConnPid, ssu2, PeerHash, State2),
+            Local = maps:get(local, State3),
+            case maps:get(ff_publish, PeerState, false) of
+                true ->
+                    State4 = clear_ff_publish(PeerHash, State3),
+                    send_our_router_info(ConnPid, ssu2, Local, floodfill),
+                    State4;
+                false ->
+                    send_our_router_info(ConnPid, ssu2, Local, plain),
+                    State3
+            end;
+        not_found ->
+            stop_conn(ConnPid),
+            State
+    end.
+
+%% Route inbound SSU2 Data blocks through the same I2NP handling as NTCP2
+%% frames. The SSU2 session delivers whole I2NP messages (already reassembled
+%% from fragments) as `{i2np, Type, MsgId, ShortExp, Body}`; NTCP2 delivers raw
+%% framing blocks `#{type := 3, data := Data}`. Rebuild the 9-byte short-header
+%% wire for each so `handle_frame/3` treats both transports identically.
+handle_ssu2_data(ConnPid, Blocks, State) ->
+    Framed = [
+        #{type => 3, data => <<Type:8, MsgId:32, ShortExp:32, Body/binary>>}
+     || {i2np, Type, MsgId, ShortExp, Body} <- Blocks
+    ],
+    lists:foldl(
+        fun(Block, AccState) -> handle_block(ConnPid, ssu2, Block, AccState) end,
+        State,
+        Framed
+    ).
+
+%% Tear down a connection whose session process died or closed, keyed by pid
+%% rather than by monitor ref (SSU2 sessions close with `{ssu2_closed, ...}`
+%% before any DOWN arrives).
+handle_conn_down_by_pid(ConnPid, State) ->
+    case find_conn_peer(ConnPid, State) of
+        {PeerHash, _PeerState} ->
+            i2p_events:notify({peer_disconnected, PeerHash}),
+            enter_backoff(PeerHash, State);
+        not_found ->
+            case inbound_conn_by_pid(ConnPid, State) of
+                {ok, Hash} ->
+                    i2p_events:notify({peer_disconnected, Hash}),
+                    Inbound = maps:remove(ConnPid, maps:get(inbound, State, #{})),
+                    State#{inbound := Inbound};
+                error ->
+                    State
+            end
+    end.
+
+handle_connect_failed(PeerHash, State) ->
+    case peer_status(PeerHash, State) of
+        connecting -> enter_backoff(PeerHash, State);
+        _ -> State
+    end.
+
+handle_conn_ready(ConnPid, Transport, State) ->
+    case find_conn_peer(ConnPid, State) of
+        {PeerHash, PeerState} ->
+            Updated = PeerState#{
+                status := connected, transport := Transport, attempts := 0, backoff := 0
+            },
+            State1 = put_peer(PeerHash, Updated, State),
+            i2p_events:notify({peer_connected, PeerHash}),
+            i2p_peer_rep:connected(PeerHash),
+            State2 = send_pending(ConnPid, Transport, PeerHash, State1),
+            State3 = send_pending_sends(ConnPid, Transport, PeerHash, State2),
+            Local = maps:get(local, State3),
+            case maps:get(ff_publish, PeerState, false) of
+                true ->
+                    State4 = clear_ff_publish(PeerHash, State3),
+                    send_our_router_info(ConnPid, Transport, Local, floodfill),
+                    State4;
+                false ->
+                    send_our_router_info(ConnPid, Transport, Local, plain),
+                    State3
+            end;
+        not_found ->
+            stop_conn(ConnPid),
+            State
+    end.
+
+handle_conn_down(MonRef, State) ->
+    case find_peer_by_mon(MonRef, State) of
+        {PeerHash, _PeerState} ->
+            i2p_events:notify({peer_disconnected, PeerHash}),
+            enter_backoff(PeerHash, State);
+        not_found ->
+            case find_inbound_by_mon(MonRef, State) of
+                {ConnPid, Hash} ->
+                    i2p_events:notify({peer_disconnected, Hash}),
+                    Inbound = maps:remove(ConnPid, maps:get(inbound, State, #{})),
+                    State#{inbound := Inbound};
+                not_found ->
+                    State
+            end
+    end.
+
+%% An accepted (`bob`-role) connection announced itself. Its RemoteRI names the
+%% peer. One live inbound session per peer hash; if the same peer dials us
+%% again, the newer session replaces the older.
+handle_inbound_ready(ConnPid, RemoteRI, Transport, State) ->
+    Hash = i2p_router_info:hash(RemoteRI),
+    State1 = stop_replaced_inbound(Hash, ConnPid, State),
+    MonRef = erlang:monitor(process, ConnPid),
+    Inbound = maps:put(ConnPid, {Hash, MonRef, Transport}, maps:get(inbound, State1, #{})),
+    State2 = State1#{inbound := Inbound},
+    State3 = learn_ri(RemoteRI, State2),
+    send_our_router_info(ConnPid, Transport, maps:get(local, State3), plain),
+    i2p_events:notify({peer_connected, Hash}),
+    State3.
+
+stop_replaced_inbound(Hash, NewConnPid, State) ->
+    Inbound0 = maps:get(inbound, State, #{}),
+    Inbound1 = maps:fold(
+        fun
+            (ConnPid, {H, _, _}, Acc) when H =:= Hash, ConnPid =/= NewConnPid ->
+                _ = stop_conn(ConnPid),
+                maps:remove(ConnPid, Acc);
+            (_, _, Acc) ->
+                Acc
+        end,
+        Inbound0,
+        Inbound0
+    ),
+    State#{inbound := Inbound1}.
+
+inbound_conn(PeerHash, #{inbound := Inbound}) ->
+    case
+        [
+            {ConnPid, T}
+         || {ConnPid, {Hash, _, T}} <- maps:to_list(Inbound), Hash =:= PeerHash
+        ]
+    of
+        [{ConnPid, T} | _] -> {ok, ConnPid, T};
+        [] -> error
+    end.
+
+find_inbound_by_mon(MonRef, #{inbound := Inbound}) ->
+    case
+        [
+            {ConnPid, Hash}
+         || {ConnPid, {Hash, M, _}} <- maps:to_list(Inbound), M =:= MonRef
+        ]
+    of
+        [{ConnPid, Hash} | _] -> {ConnPid, Hash};
+        [] -> not_found
+    end.
+
+inbound_conn_by_pid(ConnPid, #{inbound := Inbound}) ->
+    case maps:find(ConnPid, Inbound) of
+        {ok, {Hash, _, _}} -> {ok, Hash};
+        error -> error
+    end.
+
+%% An SSU2 inbound (bob-role) session that announced ready without a remote
+%% RouterInfo yet, or one for a peer we do not track; keep it registered so
+%% `{ssu2_data, ...}` frames can still be handled. Unknown-peer inbound SSU2
+%% is a no-op because the remote hash is required for routing.
+handle_ssu2_unregistered_inbound(ConnPid, State) ->
+    case maps:get(inbound, State, #{}) of
+        Inbound when map_size(Inbound) =:= 0 ->
+            MonRef = erlang:monitor(process, ConnPid),
+            State#{inbound := maps:put(ConnPid, {undefined, MonRef, ssu2}, Inbound)};
+        _ ->
+            State
+    end.
+
+%% maybe_connect/2 — the connection state machine: never touch a peer that
+%% is connecting or connected, dial fresh peers with a config, and retry
+%% backed-off peers once their backoff elapsed. Each status gets its own
+%% clause. An explicit `live_network = false` profile permits only the local
+%% self-seed, so a persisted NetDb cannot turn an offline boot into a live
+%% join.
+maybe_connect(PeerHash, State) ->
+    case network_allowed(PeerHash, State) of
+        false -> State;
+        true -> maybe_connect_status(peer_status(PeerHash, State), PeerHash, State)
+    end.
+
+network_allowed(PeerHash, State) ->
+    case application:get_env(i2per, live_network) of
+        {ok, false} -> PeerHash =:= maps:get(our_hash, State);
+        _ -> true
+    end.
+
+%% maybe_connect_status/3 — one clause per peer status.
+maybe_connect_status(none, PeerHash, State) ->
+    case find_peer_config(PeerHash, State) of
+        undefined ->
+            State;
+        PeerConfig ->
+            spawn(fun() -> init_connect(PeerHash, PeerConfig, maps:get(local, State)) end),
+            PeerState = #{
+                config => PeerConfig,
+                conn => undefined,
+                mon => undefined,
+                transport => ntcp2,
+                backoff => 0,
+                attempts => 0,
+                last_attempt => erlang:system_time(second),
+                status => connecting
+            },
+            put_peer(PeerHash, PeerState, State)
+    end;
+maybe_connect_status(connecting, _PeerHash, State) ->
+    State;
+maybe_connect_status(connected, _PeerHash, State) ->
+    State;
+maybe_connect_status(backoff, PeerHash, State) ->
+    case backoff_elapsed(PeerHash, State) of
+        true ->
+            {ok, PeerState} = peer_state(PeerHash, State),
+            spawn(fun() ->
+                init_connect(PeerHash, maps:get(config, PeerState), maps:get(local, State))
+            end),
+            Now = erlang:system_time(second),
+            Updated = PeerState#{status := connecting, last_attempt := Now},
+            put_peer(PeerHash, Updated, State);
+        false ->
+            State
+    end.
+
+init_connect(PeerHash, #{ri := RemoteRI}, Local) ->
+    Owner = whereis(?MODULE),
+    case ssu2_connect(PeerHash, RemoteRI, Local) of
+        ok ->
+            ok;
+        fallback ->
+            ntcp2_connect(PeerHash, RemoteRI, Local, Owner)
+    end.
+
+%% Outbound SSU2 dial (Alice role). Bypassed — returning `fallback` — unless
+%% SSU2 is enabled at boot, this router's SSU2 listener is up, and the remote
+%% publishes a usable SSU2 address. The blocking handshake runs in this
+%% spawned process; on success it hands the session to the peer manager and
+%% reports it as connected (as NTCP2 does) and on any failure falls back to
+%% NTCP2.
+ssu2_connect(PeerHash, RemoteRI, Local) ->
+    case
+        i2p_identity:ssu2_enabled() andalso
+            erlang:whereis(i2p_ssu2_listener) =/= undefined andalso
+            i2p_router_info:ssu2_address_options(RemoteRI) =/= error
+    of
+        false ->
+            fallback;
+        true ->
+            ssu2_connect_ready(PeerHash, RemoteRI, Local)
+    end.
+
+ssu2_connect_ready(PeerHash, RemoteRI, Local) ->
+    {ok, RemoteOpts} = i2p_router_info:ssu2_address_options(RemoteRI),
+    case maps:get(published, RemoteOpts) of
+        false ->
+            %% Firewalled remote: there is no dialable host/port, only her
+            %% introducers. Reach her indirectly through the relay machinery
+            %% (relay blocks 7/8 + token redirect); on any failure fall back
+            %% to NTCP2 exactly as the direct dial path does.
+            indirect_ssu2_connect(PeerHash, RemoteRI, RemoteOpts, Local);
+        true ->
+            %% Published claims a dialable SSU2 address; narrow the full
+            %% address-options map down to the concrete remote_opts() the conn
+            %% dial requires. Should the published address somehow lack a
+            %% concrete host/port, treat the remote as firewalled (route
+            %% through her introducers) rather than crash the dial.
+            case dialable_remote_opts(RemoteOpts) of
+                {ok, DialRemoteOpts} ->
+                    direct_ssu2_connect(PeerHash, DialRemoteOpts, Local);
+                error ->
+                    indirect_ssu2_connect(PeerHash, RemoteRI, RemoteOpts, Local)
+            end
+    end.
+
+%% Outbound SSU2 dial (Alice role) to a router publishing a dialable SSU2
+%% address. The blocking handshake runs in this spawned process; on success it
+%% hands the session to the peer manager and reports it as connected (as NTCP2
+%% does) and on any failure falls back to NTCP2.
+direct_ssu2_connect(PeerHash, RemoteOpts, Local) ->
+    LocalKeys = #{
+        static_priv => maps:get(static_priv, Local),
+        static_pub => maps:get(static_pub, Local),
+        intro_key => maps:get(intro_key, Local),
+        sign_seed => maps:get(sign_seed, Local),
+        sign_pub => maps:get(sign_pub, Local),
+        hash => maps:get(hash, Local),
+        ri => maps:get(ri, Local)
+    },
+    OurRI = maps:get(ri, Local),
+    RIBlock = i2p_router_info:to_binary(OurRI),
+    Listener = whereis(i2p_ssu2_listener),
+    case i2p_ssu2_conn:connect(LocalKeys, RemoteOpts, RIBlock, Listener) of
+        {ok, ConnPid, Keys} ->
+            Manager = whereis(?MODULE),
+            true = is_pid(Manager),
+            %% The handshake ran in this spawned process (caller of
+            %% `f:i2p_ssu2_conn:connect/5`), which owns the session and is about
+            %% to exit. Hand the session to the peer manager so its data
+            %% messages (`{ssu2_data, ...}`) reach it, then relay the ready
+            %% (echoing what the session already sent to this process) so the
+            %% manager can flush pending work and mark the peer connected.
+            ok = i2p_ssu2_conn:set_owner(ConnPid, Manager),
+            Manager ! {conn_started, PeerHash, ConnPid, ssu2},
+            Manager ! {ssu2_ready, ConnPid, Keys, undefined},
+            ok;
+        {error, _Reason} ->
+            fallback
+    end.
+
+%% Narrow a full firewalled-shaped address-options map (as produced by
+%% `f:i2p_router_info:ssu2_address_options/1`, whose host/port are
+%% `undefined` for firewalled remotes and which carries `published` /
+%% `introducers` bookkeeping on top) down to the concrete dialable
+%% `remote_opts()` map the conn dial requires — host/port as concrete
+%% values and only the five keys its success typing accepts. Returns
+%% `{ok, DialableOpts}` when the published SSU2 address is really a
+%% concrete host/port, `error` otherwise (firewalled remote).
+-spec dialable_remote_opts(map()) -> {ok, i2p_ssu2_conn:remote_opts()} | error.
+dialable_remote_opts(RemoteOpts) ->
+    Host = maps:get(host, RemoteOpts, undefined),
+    Port = maps:get(port, RemoteOpts, undefined),
+    case is_binary(Host) andalso is_integer(Port) andalso Port >= 1 andalso Port =< 65535 of
+        true ->
+            {ok, #{
+                host => Host,
+                port => Port,
+                intro_key => maps:get(intro_key, RemoteOpts),
+                peer_test => maps:get(peer_test, RemoteOpts),
+                static_key => maps:get(static_key, RemoteOpts)
+            }};
+        false ->
+            error
+    end.
+
+%% Outbound dial to a firewalled remote (no dialable SSU2 address) through one
+%% of her introducers: RelayRequest (block 7) in the introducer session, the
+%% RelayResponse (block 8) with her endpoint + token, then a redirect dial to
+%% her, carrying the token. On success the redirect session is handed to the
+%% peer manager exactly like a direct dial's, and the introducer leg (its
+%% relay served) is closed. Any failure falls back to NTCP2.
+indirect_ssu2_connect(PeerHash, RemoteRI, RemoteOpts, Local) ->
+    case pick_introducer(RemoteOpts, RemoteRI, Local) of
+        {error, _Reason} ->
+            fallback;
+        {ok, BobOpts, Relay} ->
+            case dialable_remote_opts(BobOpts) of
+                {ok, DialBobOpts} ->
+                    LocalKeys = #{
+                        static_priv => maps:get(static_priv, Local),
+                        static_pub => maps:get(static_pub, Local),
+                        intro_key => maps:get(intro_key, Local),
+                        sign_seed => maps:get(sign_seed, Local),
+                        sign_pub => maps:get(sign_pub, Local),
+                        hash => maps:get(hash, Local),
+                        ri => maps:get(ri, Local)
+                    },
+                    OurRI = maps:get(ri, Local),
+                    RIBlock = i2p_router_info:to_binary(OurRI),
+                    Listener = whereis(i2p_ssu2_listener),
+                    case
+                        i2p_ssu2_conn:connect_via_introducer(
+                            LocalKeys, DialBobOpts, RIBlock, Listener, Relay
+                        )
+                    of
+                        {ok, BobPid, CharliePid, Keys} ->
+                            Manager = whereis(?MODULE),
+                            true = is_pid(Manager),
+                            ok = i2p_ssu2_conn:set_owner(CharliePid, Manager),
+                            Manager ! {conn_started, PeerHash, CharliePid, ssu2},
+                            Manager ! {ssu2_ready, CharliePid, Keys, undefined},
+                            %% The introducer leg already served its purpose: the
+                            %% token redirect to Charlie is live, so close it
+                            %% gracefully (Bob drops the tagged/relay state).
+                            i2p_ssu2_conn:terminate_session(BobPid, 0),
+                            ok;
+                        {error, _Reason} ->
+                            fallback
+                    end
+            end
+    end.
+
+%% Pick the first introducer of a firewalled remote whose RouterInfo the NetDb
+%% holds and that publishes a dialable SSU2 address; builds the relay material
+%% for `f:i2p_ssu2_conn:connect_via_introducer/5` around it.
+pick_introducer(Introducers, RemoteRI, Local) when is_map(Introducers) ->
+    pick_introducer(maps:get(introducers, Introducers), RemoteRI, Local);
+pick_introducer([Intro | Rest], RemoteRI, Local) ->
+    case i2p_netdb_srv:find(maps:get(hash, Intro)) of
+        {ok, BobRI} ->
+            case i2p_router_info:ssu2_address_options(BobRI) of
+                {ok, BobOpts} ->
+                    case maps:get(published, BobOpts, false) of
+                        true ->
+                            {OurPort, OurIp} = our_endpoint(Local),
+                            Relay =
+                                #{
+                                    bob_hash => maps:get(hash, Intro),
+                                    charlie_hash => i2p_router_info:hash(RemoteRI),
+                                    charlie_ri => RemoteRI,
+                                    tag => maps:get(tag, Intro),
+                                    our_port => OurPort,
+                                    our_ip => OurIp,
+                                    sign_seed => maps:get(sign_seed, Local)
+                                },
+                            {ok, BobOpts, Relay};
+                        false ->
+                            pick_introducer(Rest, RemoteRI, Local)
+                    end;
+                _ ->
+                    pick_introducer(Rest, RemoteRI, Local)
+            end;
+        not_found ->
+            pick_introducer(Rest, RemoteRI, Local)
+    end;
+pick_introducer([], _RemoteRI, _Local) ->
+    {error, no_introducer}.
+
+%% The endpoint we assert reachable in a RelayRequest — what Charlie's
+%% HolePunch targets. It is our originally-published SSU2 address (the
+%% `ssu2_addr` local-key entry kept by `f:i2p_identity:set_ssu2_introducers/2`);
+%% without one we assert no endpoint at all.
+our_endpoint(Local) ->
+    case maps:get(ssu2_addr, Local, undefined) of
+        undefined ->
+            {0, <<>>};
+        Addr ->
+            Opts = maps:get(options, Addr),
+            case {maps:get(host, Opts, undefined), maps:get(port, Opts, undefined)} of
+                {undefined, _} ->
+                    {0, <<>>};
+                {_Host, undefined} ->
+                    {0, <<>>};
+                {Host, Port} ->
+                    case inet:parse_address(binary_to_list(Host)) of
+                        {ok, IP} ->
+                            {Port, iolist_to_binary(tuple_to_list(IP))};
+                        _ ->
+                            {0, <<>>}
+                    end
+            end
+    end.
+
+ntcp2_connect(PeerHash, RemoteRI, Local, Owner) ->
+    Args = #{
+        role => alice,
+        remote_ri => RemoteRI,
+        local => Local,
+        owner => Owner,
+        handshake_timeout => ?HANDSHAKE_TIMEOUT
+    },
+    case i2p_ntcp2_sup:start_connection(i2p_ntcp2_sup:conn_child(Args)) of
+        {ok, ConnPid} ->
+            Owner ! {conn_started, PeerHash, ConnPid, ntcp2};
+        {ok, ConnPid, _} ->
+            Owner ! {conn_started, PeerHash, ConnPid, ntcp2};
+        {error, _} ->
+            Owner ! {connect_failed, PeerHash}
+    end.
+
+handle_frame(ConnPid, Payload, State) ->
+    case i2p_framing:decode_blocks(Payload) of
+        {ok, Blocks} ->
+            lists:foldl(
+                fun(Block, AccState) -> handle_block(ConnPid, ntcp2, Block, AccState) end,
+                State,
+                Blocks
+            );
+        error ->
+            stop_conn(ConnPid),
+            State
+    end.
+
+handle_block(ConnPid, Transport, #{type := 3, data := Data}, State) ->
+    case i2p_i2np:decode(Data) of
+        {ok, #{type := 1, body := Body, msg_id := MsgID}} ->
+            handle_db_store(ConnPid, MsgID, Body, State);
+        {ok, #{type := 2, body := Body}} ->
+            handle_db_lookup(ConnPid, Transport, Body, State);
+        {ok, #{type := 3, body := Body}} ->
+            handle_db_search_reply(ConnPid, Transport, Body, State);
+        {ok, #{type := 10}} ->
+            State;
+        {ok, #{type := Type} = Msg} when
+            Type =:= 11;
+            Type =:= 18;
+            Type =:= 19;
+            Type =:= 25;
+            Type =:= 26
+        ->
+            forward_to_tunnel(ConnPid, Msg, State),
+            State;
+        {ok, _} ->
+            State;
+        error ->
+            stop_conn(ConnPid),
+            State
+    end;
+handle_block(_ConnPid, _Transport, _Block, State) ->
+    State.
+
+handle_db_store(ConnPid, MsgID, Body, State) ->
+    case i2p_i2np:decode_db_store(Body) of
+        {ok, #{key := Key, store_type := StoreType, data := Data} = Store} ->
+            reply_to_store(Store, MsgID, State),
+            State1 =
+                case StoreType of
+                    0 -> handle_ri_store(Key, Data, ConnPid, State);
+                    1 -> handle_ls_store(Key, Data, State);
+                    3 -> handle_ls_store(Key, Data, State);
+                    _ -> State
+                end,
+            maybe_replicate(StoreType, Key, Data, ConnPid, State1),
+            State1;
+        error ->
+            stop_conn(ConnPid),
+            State
+    end.
+
+%% A DatabaseStore with a nonzero (and not 0xFFFFFFFF) reply token asks for a
+%% DeliveryStatus acknowledgement. i2pd replies unconditionally, before any
+%% storeability check; direct replies use tunnel ID 0 when no reply tunnel is
+%% configured.
+reply_to_store(#{reply_token := 0}, _MsgID, _State) ->
+    ok;
+reply_to_store(#{reply_token := 16#FFFFFFFF}, _MsgID, _State) ->
+    ok;
+reply_to_store(#{reply_token := _, reply := {0, Gateway}}, MsgID, State) ->
+    case find_peer_by_hash(Gateway, State) of
+        {ok, TargetConn, TargetTransport} ->
+            send_i2np(
+                TargetConn,
+                TargetTransport,
+                i2p_i2np:delivery_status(MsgID, erlang:system_time(millisecond))
+            );
+        error ->
+            ok
+    end;
+reply_to_store(#{reply_token := _, reply := _}, _MsgID, _State) ->
+    ok.
+
+handle_ri_store(Key, Data, ConnPid, State) ->
+    case i2p_i2np:parse_router_info_data(Data) of
+        {ok, RIBytes} ->
+            NowMs = erlang:system_time(millisecond),
+            case i2p_netdb_srv:store_binary(RIBytes, NowMs) of
+                {ok, Outcome} ->
+                    replicate_if_new(0, Key, Data, ConnPid, Outcome, State),
+                    case i2p_router_info:decode(RIBytes) of
+                        {ok, RI} -> remember_ri(RI, State);
+                        {error, _} -> State
+                    end;
+                {error, _} ->
+                    State
+            end;
+        error ->
+            State
+    end.
+
+handle_ls_store(Key, Data, State) ->
+    case i2p_netdb_srv:store_ls_binary(Data, erlang:system_time(second)) of
+        {ok, Outcome} ->
+            replicate_if_new(1, Key, Data, undefined, Outcome, State),
+            State;
+        {error, _} ->
+            State
+    end.
+
+handle_db_lookup(ConnPid, Transport, Body, State) ->
+    case i2p_i2np:decode_db_lookup(Body) of
+        {ok, Parsed} ->
+            case maps:get(delivery, Parsed) of
+                #{tunnel_id := _ReplyTid} ->
+                    %% The asker wants the answer inside its inbound tunnel
+                    %% through the exploratory outbound pool.
+                    OurHash = maps:get(our_hash, State),
+                    tunnel_lookup_reply(Parsed, OurHash),
+                    State;
+                undefined ->
+                    answer_over_conn(ConnPid, Transport, Parsed, State),
+                    State
+            end;
+        error ->
+            stop_conn(ConnPid),
+            State
+    end.
+
+answer_over_conn(ConnPid, Transport, #{key := Key, type := Type, excluded := Excluded}, State) ->
+    case lookup_reply(Type, Key, Excluded) of
+        {store_ri, RI} ->
+            send_store(ConnPid, Transport, Key, RI, 0, undefined);
+        {store_ls, LS} ->
+            send_ls_store(ConnPid, Transport, Key, LS);
+        {search, PeerHashes} ->
+            send_search_reply(ConnPid, Transport, Key, PeerHashes, State)
+    end,
+    ok.
+
+%% lookup_reply/3 — what we would answer a DatabaseLookup with: a RouterInfo
+%% store, a LeaseSet store, or a search reply naming closer routers.
+lookup_reply(routerinfo, Key, Excluded) ->
+    case i2p_netdb_srv:find(Key) of
+        {ok, RI} -> {store_ri, RI};
+        not_found -> {search, i2p_netdb_srv:closest(Key, 4) -- Excluded}
+    end;
+lookup_reply(leaseset, Key, Excluded) ->
+    case i2p_netdb_srv:find_ls(Key) of
+        {ok, LS} -> {store_ls, LS};
+        not_found -> {search, i2p_netdb_srv:closest(Key, 4) -- Excluded}
+    end;
+lookup_reply(_AnyOrExploratory, Key, Excluded) ->
+    {search, i2p_netdb_srv:closest(Key, 4) -- Excluded}.
+
+-doc """
+Answer a tunnel-replied DatabaseLookup.
+
+Input: `Parsed` - the decoded `t:i2p_i2np:db_lookup/0`; `OurHash` - this
+router's identity hash (the search-reply sender field).
+Output: `ok` - the DatabaseStore or DatabaseSearchReply is injected into the
+requester's inbound tunnel (`{tunnel, From, ReplyTid}` delivery) through one
+of our outbound tunnels; when none is active the reply is dropped and the
+requester's retry picks another responder.
+""".
+-spec tunnel_lookup_reply(i2p_i2np:db_lookup(), i2p_crypto:hash()) -> ok.
+tunnel_lookup_reply(
+    #{key := Key, from := FromHash, type := Type, excluded := Excluded} = Parsed, OurHash
+) ->
+    #{tunnel_id := ReplyTid} = maps:get(delivery, Parsed),
+    Msg =
+        case lookup_reply(Type, Key, Excluded) of
+            {store_ri, RI} ->
+                Data = i2p_i2np:router_info_data(i2p_router_info:to_binary(RI)),
+                i2p_i2np:db_store(Key, 0, 0, undefined, Data);
+            {store_ls, LS} ->
+                i2p_i2np:db_store(
+                    Key, i2p_leaset:store_type(), 0, undefined, i2p_leaset:to_binary(LS)
+                );
+            {search, PeerHashes} ->
+                i2p_i2np:db_search_reply(Key, PeerHashes, OurHash)
+        end,
+    case i2p_tunnel_srv:pick_lookup_outbound() of
+        {ok, OutTid, _Entry} ->
+            %% Builders stamp epoch-second expirations; the standard header
+            %% wants a relative millisecond lifetime.
+            Wire =
+                i2p_i2np:encode_std(#{
+                    type => maps:get(type, Msg),
+                    msg_id => maps:get(msg_id, Msg),
+                    expiration_ms => 60_000,
+                    body => maps:get(body, Msg)
+                }),
+            ok = i2p_tunnel_srv:send_via_outbound(OutTid, {tunnel, FromHash, ReplyTid}, Wire);
+        error ->
+            ok
+    end.
+
+handle_db_search_reply(ConnPid, Transport, Body, State) ->
+    case i2p_i2np:decode_db_search_reply(Body) of
+        {ok, #{peers := PeerHashes}} ->
+            FromHash = maps:get(our_hash, State),
+            lists:foreach(
+                fun(PeerHash) ->
+                    send_db_lookup(ConnPid, Transport, FromHash, PeerHash, routerinfo)
+                end,
+                PeerHashes
+            ),
+            State;
+        error ->
+            State
+    end.
+
+send_db_lookup(ConnPid, Transport, FromHash, Key, LookupType) ->
+    Flags = lookup_type_to_flag(LookupType),
+    LookupKey =
+        case LookupType of
+            exploratory -> FromHash;
+            _ -> Key
+        end,
+    Msg = i2p_i2np:db_lookup(LookupKey, FromHash, Flags, []),
+    send_i2np(ConnPid, Transport, Msg).
+
+lookup_type_to_flag(any) -> i2p_i2np:lookup_type_any();
+lookup_type_to_flag(leaseset) -> i2p_i2np:lookup_type_leaseset();
+lookup_type_to_flag(routerinfo) -> i2p_i2np:lookup_type_routerinfo();
+lookup_type_to_flag(exploratory) -> i2p_i2np:lookup_type_exploratory().
+
+send_store(ConnPid, Transport, Key, RI, Token, Reply) ->
+    Data = i2p_i2np:router_info_data(i2p_router_info:to_binary(RI)),
+    send_i2np(ConnPid, Transport, i2p_i2np:db_store(Key, 0, Token, Reply, Data)).
+
+%% Floodfill replication: forward a newly stored entry to the 3 closest
+%% eligible floodfills (excluding self and the sender).  Only triggers on
+%% `added` or `updated` outcomes — `older`, `from_future`, and `too_old`
+%% are not forwarded (matching i2pd NetDb::Store).
+maybe_replicate(StoreType, Key, Data, ConnPid, State) ->
+    case i2p_floodfill:is_floodfill() of
+        false ->
+            ok;
+        true ->
+            OurHash = maps:get(our_hash, State),
+            SenderHash = sender_hash(ConnPid, State),
+            Outbox = i2p_floodfill:replication_outbox(StoreType, Key, Data, OurHash, SenderHash),
+            lists:foreach(
+                fun({Target, Msg}) ->
+                    i2p_peer:send_when_ready(Target, Msg)
+                end,
+                Outbox
+            ),
+            ok
+    end.
+
+replicate_if_new(StoreType, Key, Data, ConnPid, added, State) ->
+    maybe_replicate(StoreType, Key, Data, ConnPid, State);
+replicate_if_new(StoreType, Key, Data, ConnPid, updated, State) ->
+    maybe_replicate(StoreType, Key, Data, ConnPid, State);
+replicate_if_new(_StoreType, _Key, _Data, _ConnPid, _Outcome, _State) ->
+    ok.
+
+sender_hash(ConnPid, State) ->
+    case conn_peer_hash(ConnPid, State) of
+        {Hash, _} -> Hash;
+        not_found -> maps:get(our_hash, State)
+    end.
+
+send_ls_store(ConnPid, Transport, Key, LS) ->
+    Data = i2p_leaset:to_binary(LS),
+    send_i2np(
+        ConnPid, Transport, i2p_i2np:db_store(Key, i2p_leaset:store_type(), 0, undefined, Data)
+    ).
+
+send_search_reply(ConnPid, Transport, Key, PeerHashes, State) ->
+    Msg = i2p_i2np:db_search_reply(Key, PeerHashes, maps:get(our_hash, State)),
+    send_i2np(ConnPid, Transport, Msg).
+
+%% The two announcement modes: `plain` is the token-free self-announce sent to
+%% every peer we connect to; `floodfill` asks the floodfill for a
+%% DeliveryStatus acknowledgement back to us (direct reply, tunnel ID 0).
+send_our_router_info(ConnPid, Transport, Local, Mode) ->
+    OurRI = maps:get(ri, Local),
+    Hash = i2p_router_info:hash(OurRI),
+    case Mode of
+        plain -> send_store(ConnPid, Transport, Hash, OurRI, 0, undefined);
+        floodfill -> send_store(ConnPid, Transport, Hash, OurRI, ff_reply_token(), {0, Hash})
+    end.
+
+%% i2pd forbids the 0xFFFFFFFF "ignore" reply token; any other nonzero value
+%% requests the acknowledgement.
+ff_reply_token() ->
+    <<Token:32/big>> = crypto:strong_rand_bytes(4),
+    case Token of
+        16#FFFFFFFF -> 1;
+        _ -> Token
+    end.
+
+%% The boot floodfill-discovery kick chooses a small bounded set of
+%% eligible floodfills and fire exploratory lookups. Reseed completion calls
+%% this again after its RouterInfos have reached the peer manager. If the
+%% NetDb has no eligible floodfill yet, fall back to at most three known seeds
+%% so a small or unusual bundle can still make progress.
+kick_floodfill_discovery(State) ->
+    Candidates0 = discovery_candidates(State),
+    Candidates =
+        case application:get_env(i2per, live_network) of
+            {ok, false} ->
+                OurHash = maps:get(our_hash, State),
+                [Hash || Hash <- Candidates0, Hash =:= OurHash];
+            _ ->
+                Candidates0
+        end,
+    lists:foreach(
+        fun(Hash) ->
+            case peer_status(Hash, State) of
+                none -> i2p_peer:lookup(Hash, exploratory);
+                _ -> ok
+            end
+        end,
+        Candidates
+    ),
+    State.
+
+discovery_candidates(#{our_hash := OurHash, known := Known}) ->
+    Floodfills = i2p_netdb_srv:closest_floodfills(OurHash, 3, [OurHash]),
+    case Floodfills of
+        [] ->
+            lists:sublist([Hash || #{hash := Hash, ri := RI} <- Known, dialable_ri(RI)], 3);
+        _ ->
+            Floodfills
+    end.
+
+dialable_ri(RI) ->
+    case i2p_router_info:ntcp2_connector(RI) of
+        {ok, _} ->
+            true;
+        _ ->
+            i2p_identity:ssu2_enabled() andalso
+                i2p_router_info:ssu2_address_options(RI) =/= error
+    end.
+
+%% App-env override for the boot kick delay; falls back to the default.
+%% Stays a case: reads application env, which is not guard-legal.
+discovery_kick_ms() ->
+    case application:get_env(i2per, floodfill_discovery_delay_ms) of
+        {ok, Ms} when is_integer(Ms), Ms >= 0 -> Ms;
+        _ -> ?FLOODFILL_DISCOVERY_KICK_MS
+    end.
+
+%% Cancel a pending timer found by maps:find/2; a missing key stays `ok`.
+cancel_timer({ok, Ref}) ->
+    erlang:cancel_timer(Ref);
+cancel_timer(error) ->
+    ok.
+
+floodfill_publish(State) ->
+    case application:get_env(i2per, live_network) of
+        {ok, false} ->
+            State;
+        _ ->
+            %% Re-sign the RouterInfo with a fresh publish timestamp before
+            %% announcing, so peer netDbs never age our RouterInfo out (they drop
+            %% RouterInfos older than ~27 h). The router hash is unchanged.
+            Local = i2p_identity:rebuild_router_info(maps:get(local, State)),
+            State1 = State#{local := Local},
+            OurHash = maps:get(our_hash, State1),
+            FFs = i2p_netdb_srv:closest_floodfills(OurHash, 3, [OurHash]),
+            lists:foldl(fun(FFHash, Acc) -> publish_to_ff(FFHash, Acc) end, State1, FFs)
+    end.
+
+publish_to_ff(FFHash, State) ->
+    case peer_status(FFHash, State) of
+        connected ->
+            {ok, PeerState} = peer_state(FFHash, State),
+            ConnPid = maps:get(conn, PeerState),
+            Transport = maps:get(transport, PeerState, ntcp2),
+            send_our_router_info(ConnPid, Transport, maps:get(local, State), floodfill),
+            State;
+        _ ->
+            %% Connect first so the peer entry exists, then flag the
+            %% announce-on-ready so the first RouterInfo this floodfill sees
+            %% carries the reply token (never a token-free self-announce).
+            State1 = connect_to_hash(FFHash, State),
+            mark_ff_publish(FFHash, State1)
+    end.
+
+%% Connect to a hash whose RouterInfo is in the NetDb (a floodfill discovered
+%% through exploration), reusing the announce-on-ready path.
+connect_to_hash(Hash, State) ->
+    case i2p_netdb_srv:find(Hash) of
+        {ok, RI} -> connect_to(RI, State);
+        not_found -> State
+    end.
+
+mark_ff_publish(PeerHash, State) ->
+    case peer_state(PeerHash, State) of
+        {ok, PeerState} -> put_peer(PeerHash, PeerState#{ff_publish => true}, State);
+        error -> State
+    end.
+
+clear_ff_publish(PeerHash, State) ->
+    {ok, PeerState} = peer_state(PeerHash, State),
+    put_peer(PeerHash, maps:remove(ff_publish, PeerState), State).
+
+send_pending(ConnPid, Transport, PeerHash, State) ->
+    case maps:find(PeerHash, maps:get(pending, State)) of
+        {ok, LookupTypes} ->
+            FromHash = maps:get(our_hash, State),
+            lists:foreach(
+                fun(LookupType) ->
+                    send_db_lookup(ConnPid, Transport, FromHash, PeerHash, LookupType)
+                end,
+                LookupTypes
+            ),
+            State#{pending := maps:remove(PeerHash, maps:get(pending, State))};
+        error ->
+            State
+    end.
+
+enqueue_lookup(PeerHash, LookupType, State) ->
+    Pending = maps:get(pending, State),
+    Existing = maps:get(PeerHash, Pending, []),
+    case lists:member(LookupType, Existing) of
+        true ->
+            State;
+        false ->
+            State#{pending := maps:put(PeerHash, [LookupType | Existing], Pending)}
+    end.
+
+%% Send one complete I2NP message over the peer's transport. NTCP2 takes a
+%% pre-encoded `i2p_framing` block; SSU2 takes the message split into its
+%% type/msg-id/body components (the SSU2 session re-adds the 9-byte short
+%% header inside its own I2NP block).
+send_i2np(ConnPid, Transport, I2NPMsg) ->
+    %% Stays a case: is_process_alive/1 is a BIF but not guard-legal.
+    case is_process_alive(ConnPid) of
+        true ->
+            case Transport of
+                ntcp2 ->
+                    Wire = i2p_i2np:encode(I2NPMsg),
+                    Block = i2p_framing:encode_block(3, Wire),
+                    ok = i2p_ntcp2_conn:send(ConnPid, Block);
+                ssu2 ->
+                    #{type := Type, msg_id := <<MsgId:32>>, body := Body} = I2NPMsg,
+                    ok = i2p_ssu2_conn:send_i2np(ConnPid, Type, MsgId, Body)
+            end;
+        false ->
+            ok
+    end.
+
+%% Transport-agnostic teardown for a peer/inbound connection. Asks the
+%% session to close gracefully, but never blocks: an owner that ignores the
+%% close request (the other transport) is torn down with a normal shutdown
+%% exit after a short grace period.
+stop_conn(ConnPid) ->
+    Ref = make_ref(),
+    Mon = erlang:monitor(process, ConnPid),
+    ConnPid ! {stop, self(), Ref},
+    receive
+        {stopped, Ref} ->
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        {'DOWN', Mon, process, ConnPid, _} ->
+            ok
+    after 500 ->
+        erlang:demonitor(Mon, [flush]),
+        _ = catch exit(ConnPid, shutdown),
+        ok
+    end.
+
+%% learn_ri/2 — record an out-of-band RouterInfo (reseed) without dialling it.
+%%
+%% The NetDb can refuse a RouterInfo, and that outcome used to be discarded
+%% here, so a refused reseed was indistinguishable from an accepted one:
+%% remember_ri/2 added it to the known list either way and nothing was logged.
+%% A silently failing reseed then looked exactly like a working one, and the
+%% only symptom was a NetDb that never reached min_routers.
+%%
+%% Outcomes split in two. `older` means an equal-or-newer copy is already
+%% stored, so the RouterInfo IS in the NetDb and remembering it is correct. The
+%% clock rejections, `from_future` and `too_old`, mean it is not, so log those
+%% and leave it out of the known list rather than treating it as dialable.
+learn_ri(RI, State) ->
+    case i2p_netdb_srv:store(RI, erlang:system_time(millisecond)) of
+        Outcome when Outcome =:= added; Outcome =:= updated; Outcome =:= older ->
+            remember_ri(RI, State);
+        Refused ->
+            logger:warning(
+                "netdb refused RouterInfo ~0p: ~0p",
+                [i2p_router_info:hash(RI), Refused]
+            ),
+            State
+    end.
+
+remember_ri(RI, State = #{known := Known}) ->
+    Hash = i2p_router_info:hash(RI),
+    case known_hash(Hash, Known) of
+        true -> State;
+        false -> State#{known := [#{ri => RI, hash => Hash} | Known]}
+    end.
+
+known_hash(Hash, Known) ->
+    lists:any(fun(#{hash := H}) -> H =:= Hash end, Known).
+
+find_peer_config(Hash, #{known := Known, peers := Peers}) ->
+    case [Config || #{hash := H} = Config <- Known, H =:= Hash] of
+        [Config | _] ->
+            Config;
+        [] ->
+            case maps:find(Hash, Peers) of
+                {ok, #{config := Config}} -> Config;
+                error -> undefined
+            end
+    end.
+
+connect_to(RI, State) ->
+    Hash = i2p_router_info:hash(RI),
+    case peer_status(Hash, State) of
+        none ->
+            case dialable_ri(RI) of
+                true ->
+                    Config = #{ri => RI, hash => Hash},
+                    Known = maps:get(known, State),
+                    maybe_connect(Hash, State#{known := [Config | Known]});
+                false ->
+                    State
+            end;
+        _ ->
+            State
+    end.
+
+peer_state(Hash, #{peers := Peers}) ->
+    maps:find(Hash, Peers).
+
+peer_status(Hash, State) ->
+    case peer_state(Hash, State) of
+        {ok, #{status := Status}} -> Status;
+        error -> none
+    end.
+
+backoff_elapsed(PeerHash, State) ->
+    {ok, #{backoff := Backoff, last_attempt := Last}} = peer_state(PeerHash, State),
+    erlang:system_time(second) - Last >= Backoff.
+
+put_peer(Hash, PeerState, #{peers := Peers} = State) ->
+    State#{peers := maps:put(Hash, PeerState, Peers)}.
+
+enter_backoff(PeerHash, State) ->
+    {ok, PeerState} = peer_state(PeerHash, State),
+    Attempts = maps:get(attempts, PeerState),
+    Backoff = calculate_backoff(Attempts),
+    Now = erlang:system_time(second),
+    Updated = PeerState#{
+        conn := undefined,
+        mon := undefined,
+        status := backoff,
+        backoff := Backoff,
+        attempts := Attempts + 1,
+        last_attempt := Now
+    },
+    i2p_peer_rep:connect_failed(PeerHash),
+    _ = erlang:send_after(Backoff * 1000, self(), {retry_peer, PeerHash}),
+    put_peer(PeerHash, Updated, State).
+
+calculate_backoff(Attempts) ->
+    min(?MAX_BACKOFF_SECONDS, trunc(math:pow(2, Attempts))).
+
+find_conn_peer(ConnPid, #{peers := Peers}) ->
+    case
+        [
+            Hash
+         || {Hash, PeerState} <- maps:to_list(Peers),
+            maps:get(conn, PeerState, undefined) =:= ConnPid
+        ]
+    of
+        [Hash | _] -> {Hash, maps:get(Hash, Peers)};
+        [] -> not_found
+    end.
+
+%% Resolve a connection pid to its peer hash, whether the connection was dialed
+%% outbound or accepted inbound. Outbound connections carry their full peer
+%% state; inbound ones return an empty state (no backoff bookkeeping).
+conn_peer_hash(ConnPid, State) ->
+    case find_conn_peer(ConnPid, State) of
+        {Hash, PeerState} ->
+            {Hash, PeerState};
+        not_found ->
+            case maps:find(ConnPid, maps:get(inbound, State, #{})) of
+                {ok, {Hash, _, _}} -> {Hash, #{}};
+                error -> not_found
+            end
+    end.
+
+find_peer_by_hash(Hash, #{peers := Peers}) ->
+    case maps:find(Hash, Peers) of
+        {ok, #{conn := Conn, transport := Transport}} when Conn =/= undefined ->
+            {ok, Conn, Transport};
+        _ ->
+            error
+    end.
+
+find_peer_by_mon(MonRef, #{peers := Peers}) ->
+    case
+        [
+            Hash
+         || {Hash, PeerState} <- maps:to_list(Peers), maps:get(mon, PeerState, undefined) =:= MonRef
+        ]
+    of
+        [Hash | _] -> {Hash, maps:get(Hash, Peers)};
+        [] -> not_found
+    end.
+
+%% Forward a non-DB I2NP message to the tunnel manager if it is registered.
+forward_to_tunnel(ConnPid, Msg, #{our_hash := OurHash} = _State) ->
+    PeerHash =
+        case conn_peer_hash(ConnPid, _State) of
+            {Hash, _} -> Hash;
+            not_found -> OurHash
+        end,
+    case erlang:whereis(i2p_tunnel_srv) of
+        Pid when is_pid(Pid) ->
+            gen_server:cast(Pid, {i2np, ConnPid, PeerHash, Msg});
+        undefined ->
+            ok
+    end.
+
+%% Queue a message to be sent once the peer connection becomes ready.
+enqueue_send(PeerHash, Msg, #{pending_sends := Pending} = State) ->
+    Existing = maps:get(PeerHash, Pending, []),
+    State#{pending_sends := maps:put(PeerHash, [Msg | Existing], Pending)};
+enqueue_send(PeerHash, Msg, State) ->
+    enqueue_send(PeerHash, Msg, State#{pending_sends => #{}}).
+
+%% Flush queued messages to a newly connected peer.
+send_pending_sends(ConnPid, Transport, PeerHash, #{pending_sends := Pending} = State) ->
+    case maps:find(PeerHash, Pending) of
+        {ok, Msgs} ->
+            lists:foreach(
+                fun(Msg) -> send_i2np(ConnPid, Transport, Msg) end,
+                lists:reverse(Msgs)
+            ),
+            State#{pending_sends := maps:remove(PeerHash, Pending)};
+        error ->
+            State
+    end;
+send_pending_sends(_ConnPid, _Transport, _PeerHash, State) ->
+    State.

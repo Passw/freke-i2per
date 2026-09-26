@@ -1,0 +1,576 @@
+%% Unit tests for the NetDb store and DHT helpers.
+%%
+%% Store semantics (added/updated/older/future/too-old), LRU capacity
+%% eviction, day-scoped routing keys, XOR distance and closest selection, and
+%% floodfill eligibility — pinned against i2pd's NetDb/RouterInfo behavior.
+%% RouterInfo fixtures are real signed RouterInfos built by the test helpers;
+%% each carries its key material so tests can re-sign with a new timestamp,
+%% version or caps.
+
+-module(i2p_netdb_tests).
+
+-include_lib("eunit/include/eunit.hrl").
+
+-define(EXPIRE_FUTURE_MS, 2 * 60 * 1000).
+-define(EXPIRE_OLD_MS, 27 * 60 * 60 * 1000).
+
+%%% --------------------------------------------------------------------------
+%%% Routing keys and XOR distance
+%%% --------------------------------------------------------------------------
+
+%% CreateRoutingKey = SHA-256(ident ‖ yyyymmdd), exactly 40 bytes hashed.
+routing_key_matches_sha256_test() ->
+    Key = rand_hash(),
+    Day = <<"20260814">>,
+    ?assertEqual(crypto:hash(sha256, <<Key/binary, Day/binary>>), i2p_netdb:routing_key(Key, Day)),
+    ?assertEqual(32, byte_size(i2p_netdb:routing_key(Key, Day))).
+
+routing_key_changes_with_day_test() ->
+    Key = rand_hash(),
+    ?assertNotEqual(
+        i2p_netdb:routing_key(Key, <<"20260814">>), i2p_netdb:routing_key(Key, <<"20260815">>)
+    ).
+
+routing_key_requires_32_bytes_test() ->
+    ?assertError(badarg, i2p_netdb:routing_key(rand_hash(31), <<"20260814">>)),
+    ?assertError(badarg, i2p_netdb:routing_key(rand_hash(), <<"2026081">>)).
+
+distance_is_xor_and_symmetric_test() ->
+    K1 = rand_hash(),
+    K2 = rand_hash(),
+    D = i2p_netdb:distance(K1, K2),
+    ?assertEqual(32, byte_size(D)),
+    ?assertEqual(D, i2p_netdb:distance(K2, K1)),
+    ?assertEqual(crypto:exor(i2p_netdb:routing_key(K1), i2p_netdb:routing_key(K2)), D),
+    ?assertEqual(<<0:256>>, i2p_netdb:distance(K1, K1)),
+    ?assertNotEqual(<<0:256>>, i2p_netdb:distance(K1, K2)).
+
+closest_returns_distance_sorted_test() ->
+    Store0 = i2p_netdb:new(),
+    Target = rand_hash(),
+    {Store, Keys} = store_n(Store0, 5, now_ms()),
+    Closest = i2p_netdb:closest(Store, Target, 3),
+    Expected = lists:sublist(
+        lists:sort(
+            fun(A, B) -> i2p_netdb:distance(A, Target) < i2p_netdb:distance(B, Target) end, Keys
+        ),
+        3
+    ),
+    ?assertEqual(Expected, Closest),
+    ?assertEqual(3, length(Closest)),
+    ?assertEqual([], i2p_netdb:closest(Store, Target, 0)).
+
+%%% --------------------------------------------------------------------------
+%%% Store semantics
+%%% --------------------------------------------------------------------------
+
+store_add_and_find_test() ->
+    Store0 = i2p_netdb:new(),
+    {RI1, _} = fixture_router(),
+    {RI2, _} = fixture_router(),
+    {Store1, added} = i2p_netdb:store(Store0, RI1, now_ms()),
+    {Store2, added} = i2p_netdb:store(Store1, RI2, now_ms()),
+    ?assertEqual(2, i2p_netdb:count(Store2)),
+    ?assertEqual({ok, RI1}, i2p_netdb:find(Store2, i2p_router_info:hash(RI1))),
+    ?assertEqual({ok, RI2}, i2p_netdb:find(Store2, i2p_router_info:hash(RI2))),
+    ?assertEqual(error, i2p_netdb:find(Store2, rand_hash())).
+
+store_update_replaces_newer_test() ->
+    Now = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {RI1, Seed} = fixture_router(Now),
+    Key = i2p_router_info:hash(RI1),
+    {Store1, added} = i2p_netdb:store(Store0, RI1, Now),
+    %% a strictly newer RouterInfo for the same identity replaces it
+    RI2 = rebuild(RI1, Seed, Now + 1000, <<"0.9.74">>, <<"Of">>),
+    ?assertEqual(Key, i2p_router_info:hash(RI2)),
+    {Store2, updated} = i2p_netdb:store(Store1, RI2, Now),
+    ?assertEqual({ok, RI2}, i2p_netdb:find(Store2, Key)),
+    ?assertEqual(1, i2p_netdb:count(Store2)).
+
+store_older_keeps_existing_test() ->
+    Now = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {RI1, Seed} = fixture_router(Now),
+    Key = i2p_router_info:hash(RI1),
+    {Store1, added} = i2p_netdb:store(Store0, RI1, Now),
+    Older = rebuild(RI1, Seed, Now - 1000, <<"0.9.74">>, <<"Of">>),
+    {Store2, older} = i2p_netdb:store(Store1, Older, Now),
+    ?assertEqual({ok, RI1}, i2p_netdb:find(Store2, Key)),
+    %% an equal timestamp is also 'older' (i2pd: strictly newer wins)
+    Equal = rebuild(RI1, Seed, i2p_router_info:published(RI1), <<"0.9.74">>, <<"Of">>),
+    {Store3, older} = i2p_netdb:store(Store2, Equal, Now),
+    ?assertEqual({ok, RI1}, i2p_netdb:find(Store3, Key)).
+
+store_from_future_rejected_test() ->
+    Now = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {RI, _} = fixture_router(Now + ?EXPIRE_FUTURE_MS + 1),
+    Key = i2p_router_info:hash(RI),
+    {Store1, from_future} = i2p_netdb:store(Store0, RI, Now),
+    ?assertEqual(0, i2p_netdb:count(Store1)),
+    ?assertEqual(error, i2p_netdb:find(Store1, Key)).
+
+store_too_old_rejected_test() ->
+    Now = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {RI, _} = fixture_router(Now - (?EXPIRE_OLD_MS + 60 * 60 * 1000)),
+    Key = i2p_router_info:hash(RI),
+    {Store1, too_old} = i2p_netdb:store(Store0, RI, Now),
+    ?assertEqual(0, i2p_netdb:count(Store1)),
+    ?assertEqual(error, i2p_netdb:find(Store1, Key)).
+
+%% Exactly at the window edges the store accepts (i2pd uses strict < / >).
+store_window_edge_accepted_test() ->
+    Now = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {RIFuture, _} = fixture_router(Now + ?EXPIRE_FUTURE_MS),
+    {Store1, added} = i2p_netdb:store(Store0, RIFuture, Now),
+    {RIOld, _} = fixture_router(Now - ?EXPIRE_OLD_MS),
+    {Store2, added} = i2p_netdb:store(Store1, RIOld, Now),
+    ?assertEqual(2, i2p_netdb:count(Store2)).
+
+lru_evicts_oldest_test() ->
+    Now = now_ms(),
+    Store0 = i2p_netdb:new(2),
+    {RA, _} = fixture_router(Now),
+    {RB, _} = fixture_router(Now),
+    {RC, _} = fixture_router(Now),
+    ?assertNotEqual(i2p_router_info:hash(RA), i2p_router_info:hash(RB)),
+    ?assertNotEqual(i2p_router_info:hash(RB), i2p_router_info:hash(RC)),
+    {Store1, added} = i2p_netdb:store(Store0, RA, Now),
+    {Store2, added} = i2p_netdb:store(Store1, RB, Now),
+    %% storing C pushes the oldest (A) out
+    {Store3, added} = i2p_netdb:store(Store2, RC, Now),
+    ?assertEqual(2, i2p_netdb:count(Store3)),
+    ?assertEqual(error, i2p_netdb:find(Store3, i2p_router_info:hash(RA))),
+    ?assertEqual({ok, RB}, i2p_netdb:find(Store3, i2p_router_info:hash(RB))),
+    ?assertEqual({ok, RC}, i2p_netdb:find(Store3, i2p_router_info:hash(RC))).
+
+store_binary_roundtrip_test() ->
+    Now = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {RI, _} = fixture_router(Now),
+    Bin = i2p_router_info:to_binary(RI),
+    {ok, Store1, added} = i2p_netdb:store_binary(Store0, Bin, Now),
+    ?assertEqual({ok, RI}, i2p_netdb:find(Store1, i2p_router_info:hash(RI))),
+    ?assertEqual({error, too_short}, i2p_netdb:store_binary(Store0, rand_hash(), Now)),
+    %% A structurally valid RouterInfo with a corrupted signature.
+    BodySize = byte_size(Bin) - 64,
+    <<Body:BodySize/binary, Sig:64/binary>> = Bin,
+    CorruptSig = <<(binary:first(Sig) bxor 16#FF):8, (binary:part(Sig, 1, 63))/binary>>,
+    BadBin = <<Body/binary, CorruptSig/binary>>,
+    ?assertEqual({error, bad_signature}, i2p_netdb:store_binary(Store0, BadBin, Now)).
+
+remove_test() ->
+    Store0 = i2p_netdb:new(),
+    {RI, _} = fixture_router(),
+    {Store1, added} = i2p_netdb:store(Store0, RI, now_ms()),
+    Key = i2p_router_info:hash(RI),
+    {Store2, removed} = i2p_netdb:remove(Store1, Key),
+    {Store3, not_found} = i2p_netdb:remove(Store2, Key),
+    ?assertEqual(0, i2p_netdb:count(Store3)).
+
+%%% --------------------------------------------------------------------------
+%%% LeaseSet store
+%%% --------------------------------------------------------------------------
+
+ls_store_add_and_find_test() ->
+    Now = now_sec(),
+    Store0 = i2p_netdb:new(),
+    {LS1, _} = fixture_ls(Now),
+    {LS2, _} = fixture_ls(Now),
+    {Store1, added} = i2p_netdb:store_ls(Store0, LS1, Now),
+    {Store2, added} = i2p_netdb:store_ls(Store1, LS2, Now),
+    ?assertEqual(2, i2p_netdb:ls_count(Store2)),
+    ?assertEqual({ok, LS1}, i2p_netdb:find_ls(Store2, i2p_leaset:hash(LS1))),
+    ?assertEqual({ok, LS2}, i2p_netdb:find_ls(Store2, i2p_leaset:hash(LS2))),
+    ?assertEqual(error, i2p_netdb:find_ls(Store2, rand_hash())),
+    ?assertEqual([i2p_leaset:hash(LS2), i2p_leaset:hash(LS1)], i2p_netdb:ls_keys(Store2)).
+
+ls_store_update_replaces_newer_test() ->
+    Now = now_sec(),
+    Store0 = i2p_netdb:new(),
+    {LS1, SeedKey} = fixture_ls(Now),
+    Key = i2p_leaset:hash(LS1),
+    {Store1, added} = i2p_netdb:store_ls(Store0, LS1, Now),
+    %% a strictly newer LeaseSet for the same destination replaces it
+    LS2 = rebuild_ls(LS1, SeedKey, Now + 1),
+    ?assertEqual(Key, i2p_leaset:hash(LS2)),
+    {Store2, updated} = i2p_netdb:store_ls(Store1, LS2, Now),
+    ?assertEqual({ok, LS2}, i2p_netdb:find_ls(Store2, Key)),
+    ?assertEqual(1, i2p_netdb:ls_count(Store2)).
+
+ls_store_older_keeps_existing_test() ->
+    Now = now_sec(),
+    Store0 = i2p_netdb:new(),
+    {LS1, SeedKey} = fixture_ls(Now),
+    Key = i2p_leaset:hash(LS1),
+    {Store1, added} = i2p_netdb:store_ls(Store0, LS1, Now),
+    Older = rebuild_ls(LS1, SeedKey, Now - 1),
+    {Store2, older} = i2p_netdb:store_ls(Store1, Older, Now),
+    ?assertEqual({ok, LS1}, i2p_netdb:find_ls(Store2, Key)),
+    %% an equal publish time is also 'older'
+    Equal = rebuild_ls(LS1, SeedKey, i2p_leaset:published(LS1)),
+    {Store3, older} = i2p_netdb:store_ls(Store2, Equal, Now),
+    ?assertEqual({ok, LS1}, i2p_netdb:find_ls(Store3, Key)).
+
+ls_store_from_future_rejected_test() ->
+    Now = now_sec(),
+    Store0 = i2p_netdb:new(),
+    {LS, _} = fixture_ls(Now + 2 * 60 + 1),
+    {Store1, from_future} = i2p_netdb:store_ls(Store0, LS, Now),
+    ?assertEqual(0, i2p_netdb:ls_count(Store1)),
+    ?assertEqual(error, i2p_netdb:find_ls(Store1, i2p_leaset:hash(LS))).
+
+ls_store_expired_rejected_test() ->
+    Now = now_sec(),
+    Store0 = i2p_netdb:new(),
+    %% published a full lifetime (7 days) + the 12-minute threshold + 1 s ago
+    {LS, _} = fixture_ls(Now - (7 * 86400 + 12 * 60 + 1)),
+    {Store1, expired} = i2p_netdb:store_ls(Store0, LS, Now),
+    ?assertEqual(0, i2p_netdb:ls_count(Store1)),
+    ?assertEqual(error, i2p_netdb:find_ls(Store1, i2p_leaset:hash(LS))),
+    %% exactly at the lifetime + threshold edge the store still accepts
+    {Edge, _} = fixture_ls(Now - (7 * 86400 + 12 * 60)),
+    {Store2, added} = i2p_netdb:store_ls(Store1, Edge, Now),
+    ?assertEqual(1, i2p_netdb:ls_count(Store2)).
+
+ls_lru_evicts_oldest_test() ->
+    Now = now_sec(),
+    Store0 = i2p_netdb:new(2),
+    {LA, _} = fixture_ls(Now),
+    {LB, _} = fixture_ls(Now),
+    {LC, _} = fixture_ls(Now),
+    {Store1, added} = i2p_netdb:store_ls(Store0, LA, Now),
+    {Store2, added} = i2p_netdb:store_ls(Store1, LB, Now),
+    {Store3, added} = i2p_netdb:store_ls(Store2, LC, Now),
+    ?assertEqual(2, i2p_netdb:ls_count(Store3)),
+    ?assertEqual(error, i2p_netdb:find_ls(Store3, i2p_leaset:hash(LA))),
+    ?assertEqual({ok, LB}, i2p_netdb:find_ls(Store3, i2p_leaset:hash(LB))),
+    ?assertEqual({ok, LC}, i2p_netdb:find_ls(Store3, i2p_leaset:hash(LC))).
+
+ls_store_binary_roundtrip_test() ->
+    Now = now_sec(),
+    Store0 = i2p_netdb:new(),
+    {LS, _} = fixture_ls(Now),
+    Bin = i2p_leaset:to_binary(LS),
+    {ok, Store1, added} = i2p_netdb:store_ls_binary(Store0, Bin, Now),
+    ?assertEqual({ok, LS}, i2p_netdb:find_ls(Store1, i2p_leaset:hash(LS))),
+    ?assertEqual({error, too_short}, i2p_netdb:store_ls_binary(Store0, rand_hash(), Now)),
+    %% a structurally valid LeaseSet with a corrupted signature
+    BodySize = byte_size(Bin) - 64,
+    <<Body:BodySize/binary, Sig:64/binary>> = Bin,
+    CorruptSig = <<(binary:first(Sig) bxor 16#FF):8, (binary:part(Sig, 1, 63))/binary>>,
+    BadBin = <<Body/binary, CorruptSig/binary>>,
+    ?assertEqual({error, bad_signature}, i2p_netdb:store_ls_binary(Store0, BadBin, Now)).
+
+%%% --------------------------------------------------------------------------
+%%% Floodfill predicates
+%%% --------------------------------------------------------------------------
+
+version_number_test() ->
+    ?assertEqual(974, version_number_of(<<"0.9.74">>)),
+    ?assertEqual(962, version_number_of(<<"0.9.62">>)),
+    ?assertEqual(9680, version_number_of(<<"0.9.68-0">>)),
+    ?assertEqual(0, version_number_of(<<>>)),
+    ?assertEqual(0, version_number_of(<<"rolling">>)).
+
+declared_floodfill_test() ->
+    ?assert(declared_floodfill_of(<<"Of">>)),
+    ?assert(declared_floodfill_of(<<"f">>)),
+    ?assertNot(declared_floodfill_of(<<"O">>)),
+    ?assertNot(declared_floodfill_of(<<"">>)).
+
+eligible_floodfill_version_gate_test() ->
+    Now = now_ms(),
+    {FF, Seed} = fixture_floodfill(Now),
+    ?assert(i2p_netdb:eligible_floodfill(FF)),
+    %% old version not eligible (i2pd NETDB_MIN_FLOODFILL_VERSION = 0.9.62)
+    Old = rebuild(FF, Seed, Now, <<"0.9.50">>, <<"Of">>),
+    ?assertNot(i2p_netdb:eligible_floodfill(Old)),
+    %% boundary 0.9.62 is eligible
+    Edge = rebuild(FF, Seed, Now, <<"0.9.62">>, <<"Of">>),
+    ?assert(i2p_netdb:eligible_floodfill(Edge)).
+
+eligible_floodfill_caps_gate_test() ->
+    Now = now_ms(),
+    {FF, Seed} = fixture_floodfill(Now),
+    ?assert(i2p_netdb:eligible_floodfill(FF)),
+    %% router caps U (unreachable) or H (hidden) disqualify (i2pd IsPublished)
+    Unreachable = rebuild(FF, Seed, Now, <<"0.9.74">>, <<"UOf">>),
+    ?assertNot(i2p_netdb:eligible_floodfill(Unreachable)),
+    Hidden = rebuild(FF, Seed, Now, <<"0.9.74">>, <<"Hf">>),
+    ?assertNot(i2p_netdb:eligible_floodfill(Hidden)).
+
+eligible_floodfill_declared_but_unpublished_rejected_test() ->
+    Now = now_ms(),
+    %% caps declare floodfill but the router has no NTCP2 address at all —
+    %% the caps alone don't qualify it.
+    {RI, _} = fixture_bare_floodfill(Now),
+    ?assert(i2p_netdb:declared_floodfill(RI)),
+    ?assertNot(i2p_netdb:eligible_floodfill(RI)).
+
+eligible_floodfill_nonpublished_ntcp2_rejected_test() ->
+    Now = now_ms(),
+    {RI, _} = fixture_nonpublished_floodfill(Now),
+    ?assert(i2p_netdb:declared_floodfill(RI)),
+    ?assertNot(i2p_netdb:eligible_floodfill(RI)).
+
+closest_floodfills_filters_by_eligibility_test() ->
+    Now = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {FF1, _} = fixture_floodfill(Now),
+    {FF2, _} = fixture_floodfill(Now),
+    {Plain, _} = fixture_router(Now),
+    {Store1, added} = i2p_netdb:store(Store0, FF1, Now),
+    {Store2, added} = i2p_netdb:store(Store1, FF2, Now),
+    {Store3, added} = i2p_netdb:store(Store2, Plain, Now),
+    Target = i2p_router_info:hash(FF1),
+    FFs = i2p_netdb:closest_floodfills(Store3, Target, 5, []),
+    ?assertEqual(2, length(FFs)),
+    ?assert(lists:member(i2p_router_info:hash(FF1), FFs)),
+    ?assert(lists:member(i2p_router_info:hash(FF2), FFs)),
+    ?assertNot(lists:member(i2p_router_info:hash(Plain), FFs)),
+    %% excluded floodfills are skipped
+    ?assertEqual(
+        [],
+        i2p_netdb:closest_floodfills(
+            Store3, Target, 5, [i2p_router_info:hash(FF1), i2p_router_info:hash(FF2)]
+        )
+    ).
+
+closest_non_floodfills_excludes_declared_test() ->
+    Now = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {FF, _} = fixture_floodfill(Now),
+    {P1, _} = fixture_router(Now),
+    {P2, _} = fixture_router(Now),
+    {Store1, added} = i2p_netdb:store(Store0, FF, Now),
+    {Store2, added} = i2p_netdb:store(Store1, P1, Now),
+    {Store3, added} = i2p_netdb:store(Store2, P2, Now),
+    Target = i2p_router_info:hash(FF),
+    NonFF = i2p_netdb:closest_non_floodfills(Store3, Target, 5, []),
+    ?assertEqual(2, length(NonFF)),
+    ?assertNot(lists:member(i2p_router_info:hash(FF), NonFF)),
+    ?assert(lists:member(i2p_router_info:hash(P1), NonFF)),
+    ?assert(lists:member(i2p_router_info:hash(P2), NonFF)).
+
+%%% --------------------------------------------------------------------------
+%%% Persistence: to_binary / from_binary round-trip
+%%% --------------------------------------------------------------------------
+
+binary_roundtrip_preserves_count_and_find_test() ->
+    Now = now_ms(),
+    Store0 = i2p_netdb:new(),
+    {RI1, _} = fixture_router(Now),
+    {RI2, _} = fixture_floodfill(Now),
+    {Store1, added} = i2p_netdb:store(Store0, RI1, Now),
+    {Store2, added} = i2p_netdb:store(Store1, RI2, Now),
+    Bin = i2p_netdb:to_binary(Store2),
+    {ok, Restored} = i2p_netdb:from_binary(Bin),
+    ?assertEqual(2, i2p_netdb:count(Restored)),
+    ?assertEqual(i2p_netdb:capacity(Store2), i2p_netdb:capacity(Restored)),
+    ?assertEqual({ok, RI1}, i2p_netdb:find(Restored, i2p_router_info:hash(RI1))),
+    ?assertEqual({ok, RI2}, i2p_netdb:find(Restored, i2p_router_info:hash(RI2))),
+    ?assertEqual(i2p_netdb:keys(Store2), i2p_netdb:keys(Restored)).
+
+binary_roundtrip_lease_sets_test() ->
+    NowSec = now_sec(),
+    Store0 = i2p_netdb:new(),
+    {LS, _} = fixture_ls(NowSec),
+    {Store1, added} = i2p_netdb:store_ls(Store0, LS, NowSec),
+    Bin = i2p_netdb:to_binary(Store1),
+    {ok, Restored} = i2p_netdb:from_binary(Bin),
+    ?assertEqual(1, i2p_netdb:ls_count(Restored)),
+    ?assertEqual({ok, LS}, i2p_netdb:find_ls(Restored, i2p_leaset:hash(LS))).
+
+binary_roundtrip_empty_store_test() ->
+    Store = i2p_netdb:new(),
+    Bin = i2p_netdb:to_binary(Store),
+    ?assertEqual({ok, Store}, i2p_netdb:from_binary(Bin)).
+
+binary_from_bad_magic_test() ->
+    ?assertMatch({error, bad_magic}, i2p_netdb:from_binary(<<"BADMGIC">>)).
+
+binary_from_truncated_test() ->
+    ?assertMatch({error, _}, i2p_netdb:from_binary(<<"I2PNETDB", 1:8, 0:32>>)).
+
+%%% --------------------------------------------------------------------------
+%%% Expiry: remove_expired
+%%% --------------------------------------------------------------------------
+
+remove_expired_drops_old_routers_test() ->
+    NowMs = now_ms(),
+    Store0 = i2p_netdb:new(),
+    %% store fresh, then check expiry at a future time when it's old
+    {Fresh, _} = fixture_router(NowMs),
+    {S1, added} = i2p_netdb:store(Store0, Fresh, NowMs),
+    ?assertEqual(1, i2p_netdb:count(S1)),
+    FutureMs = NowMs + (27 * 60 * 60 * 1000 + 1),
+    {S2, {1, 0}} = i2p_netdb:remove_expired(S1, FutureMs, now_sec()),
+    ?assertEqual(0, i2p_netdb:count(S2)),
+    ?assertEqual(error, i2p_netdb:find(S2, i2p_router_info:hash(Fresh))).
+
+remove_expired_at_boundary_keeps_router_test() ->
+    NowMs = now_ms(),
+    Store0 = i2p_netdb:new(),
+    %% store fresh, then check expiry at exactly 27h (boundary: still valid)
+    {RI, _} = fixture_router(NowMs),
+    {S1, added} = i2p_netdb:store(Store0, RI, NowMs),
+    BoundaryMs = NowMs + (27 * 60 * 60 * 1000),
+    {S2, {0, 0}} = i2p_netdb:remove_expired(S1, BoundaryMs, now_sec()),
+    ?assertEqual(1, i2p_netdb:count(S2)).
+
+remove_expired_drops_expired_ls_test() ->
+    NowSec = now_sec(),
+    Store0 = i2p_netdb:new(),
+    %% store fresh, then check expiry at a far-future time
+    {LS, _} = fixture_ls(NowSec),
+    {S1, added} = i2p_netdb:store_ls(Store0, LS, NowSec),
+    %% far future: LS will be expired (published + 7d + threshold < FarFutureSec)
+    FarFutureSec = NowSec + 7 * 86400 + 12 * 60 + 1,
+    {S2, {0, 1}} = i2p_netdb:remove_expired(S1, now_ms(), FarFutureSec),
+    ?assertEqual(0, i2p_netdb:ls_count(S2)).
+
+remove_expired_keeps_fresh_ls_test() ->
+    NowSec = now_sec(),
+    Store0 = i2p_netdb:new(),
+    {LS, _} = fixture_ls(NowSec),
+    {S1, added} = i2p_netdb:store_ls(Store0, LS, NowSec),
+    {S2, {0, 0}} = i2p_netdb:remove_expired(S1, now_ms(), NowSec),
+    ?assertEqual(1, i2p_netdb:ls_count(S2)).
+
+%%% --------------------------------------------------------------------------
+%%% Fixtures
+%%% --------------------------------------------------------------------------
+
+now_ms() ->
+    erlang:system_time(millisecond).
+
+now_sec() ->
+    erlang:system_time(second).
+
+rand_hash() ->
+    rand_hash(32).
+
+rand_hash(N) ->
+    crypto:strong_rand_bytes(N).
+
+%% {RouterInfo, SeedKey} where SeedKey = {{SPub, Seed}, {CPub, _}} lets tests
+%% rebuild the same identity with a different timestamp/version/caps.
+fixture_router() ->
+    fixture_router(now_ms()).
+
+fixture_router(Timestamp) ->
+    SeedKey = new_seed_key(),
+    {build_from(SeedKey, Timestamp, <<"0.9.74">>, <<"4">>, <<"192.0.2.10">>), SeedKey}.
+
+fixture_floodfill(Timestamp) ->
+    SeedKey = new_seed_key(),
+    {build_from(SeedKey, Timestamp, <<"0.9.74">>, <<"Of">>, <<"192.0.2.10">>), SeedKey}.
+
+%% Declared floodfill (caps 'f') but no NTCP2 address at all — caps alone
+%% don't qualify it.
+fixture_bare_floodfill(Timestamp) ->
+    SeedKey = new_seed_key(),
+    {{SPub, Seed}, {CPub, _}} = SeedKey,
+    Identity = i2p_keys:from_keys(CPub, SPub),
+    Opts = #{
+        <<"netId">> => <<"2">>,
+        <<"router.version">> => <<"0.9.74">>,
+        <<"caps">> => <<"f">>
+    },
+    RI = i2p_router_info:build(Identity, Timestamp, [], Opts, Seed),
+    {RI, SeedKey}.
+
+fixture_nonpublished_floodfill(Timestamp) ->
+    SeedKey = new_seed_key(),
+    {{SPub, Seed}, {CPub, _}} = SeedKey,
+    Identity = i2p_keys:from_keys(CPub, SPub),
+    Addr = i2p_router_info:ntcp2_nonpublished_address(ipv4, rand_hash()),
+    Opts = #{
+        <<"netId">> => <<"2">>,
+        <<"router.version">> => <<"0.9.74">>,
+        <<"caps">> => <<"f">>
+    },
+    RI = i2p_router_info:build(Identity, Timestamp, [Addr], Opts, Seed),
+    {RI, SeedKey}.
+
+new_seed_key() ->
+    {{SPub, Seed}, {CPub, _}} = {i2p_crypto:ed25519_keygen(), i2p_crypto:x25519_keygen()},
+    {{SPub, Seed}, {CPub, rand_hash()}}.
+
+build_from(SeedKey, Timestamp, Version, Caps, Host) ->
+    {{SPub, Seed}, {CPub, _}} = SeedKey,
+    Identity = i2p_keys:from_keys(CPub, SPub),
+    Addr = i2p_router_info:ntcp2_address(Host, 4668, rand_hash(), rand_hash(16)),
+    Opts = maps:merge(
+        #{<<"netId">> => <<"2">>, <<"router.version">> => Version},
+        caps_map(Caps)
+    ),
+    i2p_router_info:build(Identity, Timestamp, [Addr], Opts, Seed).
+
+%% Re-sign a fixture's identity with a new timestamp/version/caps. The
+%% RouterInfo's identity and the seed key come from the same fixture, so the
+%% rebuilt RouterInfo keeps the same hash.
+rebuild(RI, SeedKey, Timestamp, Version, Caps) ->
+    Identity = i2p_router_info:identity(RI),
+    {{_SPub, Seed}, _CPub} = SeedKey,
+    Addr = i2p_router_info:ntcp2_address(<<"192.0.2.10">>, 4668, rand_hash(), rand_hash(16)),
+    Opts = maps:merge(
+        #{<<"netId">> => <<"2">>, <<"router.version">> => Version},
+        caps_map(Caps)
+    ),
+    i2p_router_info:build(Identity, Timestamp, [Addr], Opts, Seed).
+
+%% {LeaseSet, SeedKey} — the SeedKey signs the same destination identity, so a
+%% rebuilt LeaseSet keeps the same hash.
+fixture_ls(TimestampSec) ->
+    SeedKey = new_seed_key(),
+    build_ls(SeedKey, TimestampSec).
+
+build_ls(SeedKey, TimestampSec) ->
+    {{SPub, Seed}, {CPub, _}} = SeedKey,
+    Identity = i2p_keys:from_keys(CPub, SPub),
+    Lease = #{
+        gateway => rand_hash(),
+        tunnel_id => 1,
+        end_date => (now_ms() + 60 * 1000) band 16#FFFFFFFF
+    },
+    {i2p_leaset:build(Identity, TimestampSec, 7, [Lease], Seed), SeedKey}.
+
+%% Re-sign a fixture LeaseSet with a new publish time (same destination hash).
+rebuild_ls(LS, SeedKey, TimestampSec) ->
+    Identity = i2p_leaset:identity(LS),
+    {{_SPub, Seed}, _CPub} = SeedKey,
+    i2p_leaset:build(Identity, TimestampSec, 7, i2p_leaset:leases(LS), Seed).
+
+caps_map(undefined) ->
+    #{};
+caps_map(Caps) ->
+    #{<<"caps">> => Caps}.
+
+version_number_of(Version) ->
+    i2p_netdb:version_number(rebuild_fresh_version(Version)).
+
+rebuild_fresh_version(Version) ->
+    SeedKey = new_seed_key(),
+    build_from(SeedKey, now_ms(), Version, <<"4">>, <<"192.0.2.10">>).
+
+declared_floodfill_of(Caps) ->
+    SeedKey = new_seed_key(),
+    RI = build_from(SeedKey, now_ms(), <<"0.9.74">>, Caps, <<"192.0.2.10">>),
+    i2p_netdb:declared_floodfill(RI).
+
+%% Store N freshly built routers, returning the store and their hashes.
+store_n(Store, N, Now) ->
+    store_n(Store, N, Now, []).
+
+store_n(Store, 0, _Now, Acc) ->
+    {Store, lists:reverse(Acc)};
+store_n(Store, N, Now, Acc) ->
+    {RI, _} = fixture_router(Now),
+    Key = i2p_router_info:hash(RI),
+    {Store1, added} = i2p_netdb:store(Store, RI, Now),
+    store_n(Store1, N - 1, Now, [Key | Acc]).

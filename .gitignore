@@ -1,0 +1,38 @@
+_build/
+devenv.local.*
+.devenv/
+.direnv/
+erl_crash.dump
+rebar3.crashdump
+priv/native/
+*.so
+doc/
+apps/*/doc/
+
+AGENTS.md
+
+# Local secrets and assistant state are never committed
+.env
+.env.*
+*.cookie
+/opencode.json
+
+# Router data: a persistent boot writes the router identity and server-tunnel
+# destination private keys under the default data_dir (./data). Never committed.
+/data/
+
+# Local tool state is never committed
+/i2pd-out
+
+# Local deployment material: not part of the software tree. Kept in the local
+# checkout only; operators install from the release tarball in dist/.
+/deploy/
+
+# release artifacts (built cleanly by scripts/build-release.sh — never commit)
+/dist/
+# isolated container-build dir used by scripts/build-release.sh (podman path)
+/_build-debian/
+
+# [epiq]: local hydrated state is never committed
+.epiq/events/
+.epiq/log/

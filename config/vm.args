@@ -1,0 +1,12 @@
+## Default VM args shipped inside the release tarball.
+## OTP requires a node name, but the default release keeps distribution
+## entirely local: the distribution listener and epmd are explicitly disabled,
+## and no cookie is shipped. An operator who needs distribution access supplies
+## their own -sname and a random -setcookie, and re-enables the listener with
+## -dist_listen true.
+## Kernel poll keeps socket wakeups off the polling loop (an I2P router is
+## mostly sockets).
+-sname i2per
+-dist_listen false
+-start_epmd false
++K true

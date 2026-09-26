@@ -1,0 +1,9 @@
+i2per
+Copyright (c) 2026 David Åberg
+
+The implementation was informed by the publicly documented behavior of i2pd.
+i2pd is distributed under the BSD 3-Clause License:
+Copyright (c) 2013-2026, The PurpleI2P Project
+
+This project interoperates with I2P and i2pd. It does not bundle source code
+from either project.
